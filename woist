@@ -1,17 +1,66 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import ipaddress
 import json
+import shutil
 import socket
+import ssl
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
-API_URL = (
+try:
+    import dns.exception
+    import dns.reversename
+    import dns.resolver
+except ImportError:
+    print(
+        "Fehler: dnspython ist nicht installiert. Installiere es mit: pip3 install dnspython",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+APP_VERSION = "4.0.0"
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+YELLOW = "\033[93m"
+MAGENTA = "\033[95m"
+RED = "\033[91m"
+
+IP_API_URL = (
     "http://ip-api.com/json/{target}"
-    "?fields=status,message,query,country,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse"
+    "?fields=status,message,query,country,regionName,city,zip,lat,lon,timezone,"
+    "isp,org,as,reverse,hosting,proxy,mobile"
 )
+IPWHO_URL = "https://ipwho.is/{target}"
+
+CACHE_DIR = Path.home() / ".cache" / "woist"
+CACHE_FILE = CACHE_DIR / "geoip_cache.json"
+CACHE_TTL = 60 * 60 * 24  # 24 Stunden
+
+
+# =========================
+# utils
+# =========================
+def style(text: str, color: str, use_color: bool) -> str:
+    return f"{color}{text}{RESET}" if use_color else text
+
+
+def uniq(values: list[str]) -> list[str]:
+    out = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
 
 
 def normalize_target(value: str) -> str:
@@ -31,68 +80,227 @@ def normalize_target(value: str) -> str:
     elif cleaned.count(":") == 1 and not cleaned.replace(":", "").isdigit():
         cleaned = cleaned.rsplit(":", 1)[0]
 
-    return cleaned.strip()
+    return cleaned.strip().rstrip(".")
 
 
-def resolve_target(value: str) -> tuple[str, str]:
+def is_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def read_targets(single_targets: list[str], file_path: str | None) -> list[str]:
+    targets = []
+    targets.extend(single_targets)
+
+    if file_path:
+        path = Path(file_path)
+        if not path.exists():
+            raise ValueError(f"Datei nicht gefunden: {file_path}")
+
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                targets.append(line)
+
+    targets = uniq(targets)
+
+    if not targets:
+        raise ValueError("Keine Ziele angegeben.")
+
+    return targets
+
+
+# =========================
+# cache
+# =========================
+def load_cache() -> dict:
+    try:
+        if CACHE_FILE.exists():
+            return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cache_get(ip: str) -> dict | None:
+    cache = load_cache()
+    entry = cache.get(ip)
+
+    if not entry:
+        return None
+
+    if time.time() - entry.get("timestamp", 0) > CACHE_TTL:
+        return None
+
+    return entry.get("data")
+
+
+def cache_set(ip: str, data: dict) -> None:
+    cache = load_cache()
+    cache[ip] = {"timestamp": time.time(), "data": data}
+    save_cache(cache)
+
+
+def clear_cache() -> bool:
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+        return True
+    return False
+
+
+def cache_stats() -> dict:
+    cache = load_cache()
+    entries = len(cache)
+    newest = 0.0
+    oldest = None
+
+    for item in cache.values():
+        ts = item.get("timestamp", 0)
+        if ts > newest:
+            newest = ts
+        if oldest is None or ts < oldest:
+            oldest = ts
+
+    return {
+        "datei": str(CACHE_FILE),
+        "eintraege": entries,
+        "neuste_unix": newest if newest else None,
+        "aelteste_unix": oldest,
+    }
+
+
+# =========================
+# dns
+# =========================
+def resolver_instance(nameserver: str | None) -> dns.resolver.Resolver:
+    res = dns.resolver.Resolver()
+    if nameserver:
+        res.nameservers = [nameserver]
+    return res
+
+
+def query_dns(name: str, record_type: str, nameserver: str | None) -> tuple[list[str], int | None]:
+    res = resolver_instance(nameserver)
+    try:
+        answer = res.resolve(name, record_type)
+        values = []
+        for item in answer:
+            text = item.to_text().strip()
+            if text.endswith("."):
+                text = text[:-1]
+            values.append(text)
+        ttl = getattr(answer.rrset, "ttl", None)
+        return uniq(values), ttl
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        return [], None
+    except dns.exception.DNSException:
+        return [], None
+
+
+def reverse_dns_lookup(ip: str, nameserver: str | None) -> str:
+    try:
+        rev_name = dns.reversename.from_address(ip)
+        answer = resolver_instance(nameserver).resolve(rev_name, "PTR")
+        ptr = answer[0].to_text().strip()
+        return ptr[:-1] if ptr.endswith(".") else ptr
+    except Exception:
+        return "-"
+
+
+def resolve_target(value: str, nameserver: str | None) -> dict:
     cleaned = normalize_target(value)
 
-    try:
-        ipaddress.ip_address(cleaned)
-        return cleaned, cleaned
-    except ValueError:
-        pass
+    if is_ip(cleaned):
+        version = ipaddress.ip_address(cleaned).version
+        return {
+            "eingabe": cleaned,
+            "typ": "ip",
+            "hostname": None,
+            "cname": [],
+            "mx": [],
+            "ns": [],
+            "txt": [],
+            "a": [cleaned] if version == 4 else [],
+            "aaaa": [cleaned] if version == 6 else [],
+            "ttl": {},
+            "bevorzugte_ip": cleaned,
+            "reverse_dns": reverse_dns_lookup(cleaned, nameserver),
+        }
 
-    try:
-        infos = socket.getaddrinfo(cleaned, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise RuntimeError(
-            f"Hostname konnte nicht aufgelöst werden: {cleaned}"
-        ) from exc
+    cname, cname_ttl = query_dns(cleaned, "CNAME", nameserver)
+    a_records, a_ttl = query_dns(cleaned, "A", nameserver)
+    aaaa_records, aaaa_ttl = query_dns(cleaned, "AAAA", nameserver)
+    mx_records, mx_ttl = query_dns(cleaned, "MX", nameserver)
+    ns_records, ns_ttl = query_dns(cleaned, "NS", nameserver)
+    txt_records, txt_ttl = query_dns(cleaned, "TXT", nameserver)
 
-    addresses = []
-    for info in infos:
-        addr = info[4][0]
-        if addr not in addresses:
-            addresses.append(addr)
+    if not a_records and not aaaa_records and cname:
+        for alias in cname:
+            if not a_records:
+                a_records, a_ttl = query_dns(alias, "A", nameserver)
+            if not aaaa_records:
+                aaaa_records, aaaa_ttl = query_dns(alias, "AAAA", nameserver)
 
-    if not addresses:
-        raise RuntimeError(f"Keine IP-Adresse für {cleaned} gefunden.")
+    if not a_records and not aaaa_records:
+        raise RuntimeError(f"Keine A- oder AAAA-Records für {cleaned} gefunden.")
 
-    preferred = next((addr for addr in addresses if ":" not in addr), addresses[0])
-    return cleaned, preferred
+    preferred = a_records[0] if a_records else aaaa_records[0]
+
+    return {
+        "eingabe": cleaned,
+        "typ": "hostname",
+        "hostname": cleaned,
+        "cname": cname,
+        "mx": mx_records,
+        "ns": ns_records,
+        "txt": txt_records,
+        "a": a_records,
+        "aaaa": aaaa_records,
+        "ttl": {
+            "CNAME": cname_ttl,
+            "A": a_ttl,
+            "AAAA": aaaa_ttl,
+            "MX": mx_ttl,
+            "NS": ns_ttl,
+            "TXT": txt_ttl,
+        },
+        "bevorzugte_ip": preferred,
+        "reverse_dns": reverse_dns_lookup(preferred, nameserver),
+    }
 
 
-def lookup_ip(target: str) -> dict:
-    url = API_URL.format(target=urllib.parse.quote(target, safe=""))
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "woist/1.1.0"},
-    )
-
+# =========================
+# geoip
+# =========================
+def http_json(url: str, user_agent: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
-            payload = response.read().decode("utf-8")
+            return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP-Fehler der GeoIP-API: {exc.code}") from exc
+        raise RuntimeError(f"HTTP-Fehler bei API-Abfrage: {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Netzwerkfehler bei der API-Abfrage: {exc.reason}") from exc
-
-    try:
-        data = json.loads(payload)
+        raise RuntimeError(f"Netzwerkfehler bei API-Abfrage: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Ungültige Antwort der GeoIP-API erhalten.") from exc
+        raise RuntimeError("Ungültige JSON-Antwort erhalten.") from exc
 
+
+def lookup_ip_api(target: str) -> dict:
+    data = http_json(IP_API_URL.format(target=urllib.parse.quote(target, safe="")), f"woist/{APP_VERSION}")
     if data.get("status") != "success":
-        raise RuntimeError(data.get("message", "Unbekannter API-Fehler"))
+        raise RuntimeError(data.get("message", "ip-api Fehler"))
 
-    return data
-
-
-def build_result(original: str, resolved_ip: str, data: dict) -> dict:
     return {
-        "eingabe": original,
-        "ziel_ip": data.get("query", resolved_ip),
+        "quelle": "ip-api",
+        "ziel_ip": data.get("query", target),
         "land": data.get("country", "-"),
         "region": data.get("regionName", "-"),
         "stadt": data.get("city", "-"),
@@ -103,58 +311,953 @@ def build_result(original: str, resolved_ip: str, data: dict) -> dict:
         "isp": data.get("isp", "-"),
         "organisation": data.get("org", "-"),
         "as": data.get("as", "-"),
-        "reverse_dns": data.get("reverse", "-"),
+        "reverse_dns_api": data.get("reverse", "-"),
+        "hosting": bool(data.get("hosting")),
+        "proxy": bool(data.get("proxy")),
+        "mobile": bool(data.get("mobile")),
     }
 
 
-def print_text_result(result: dict, show_resolved: bool) -> None:
-    print(f"Eingabe:      {result['eingabe']}")
-    if show_resolved:
-        print(f"Aufgelöst zu: {result['ziel_ip']}")
-    print(f"Land:         {result['land']}")
-    print(f"Region:       {result['region']}")
-    print(f"Stadt:        {result['stadt']}")
-    print(f"PLZ:          {result['plz']}")
-    print(f"Breitengrad:  {result['breitengrad']}")
-    print(f"Längengrad:   {result['laengengrad']}")
-    print(f"Zeitzone:     {result['zeitzone']}")
-    print(f"ISP:          {result['isp']}")
-    print(f"Organisation: {result['organisation']}")
-    print(f"AS:           {result['as']}")
-    print(f"Reverse DNS:  {result['reverse_dns']}")
+def lookup_ipwhois(target: str) -> dict:
+    data = http_json(IPWHO_URL.format(target=urllib.parse.quote(target, safe="")), f"woist/{APP_VERSION}")
+    if not data.get("success", False):
+        raise RuntimeError(data.get("message", "ipwho.is Fehler"))
+
+    connection = data.get("connection", {}) or {}
+    return {
+        "quelle": "ipwho.is",
+        "ziel_ip": data.get("ip", target),
+        "land": data.get("country", "-"),
+        "region": data.get("region", "-"),
+        "stadt": data.get("city", "-"),
+        "plz": data.get("postal", "-"),
+        "breitengrad": data.get("latitude", "-"),
+        "laengengrad": data.get("longitude", "-"),
+        "zeitzone": (data.get("timezone", {}) or {}).get("id", "-"),
+        "isp": connection.get("isp", "-"),
+        "organisation": connection.get("org", "-"),
+        "as": connection.get("asn", "-"),
+        "reverse_dns_api": "-",
+        "hosting": False,
+        "proxy": False,
+        "mobile": False,
+    }
 
 
+def lookup_geo_with_cache(target: str) -> tuple[dict, dict, bool]:
+    cached = cache_get(target)
+    if cached:
+        return cached["primary"], cached["secondary"], True
+
+    primary = lookup_ip_api(target)
+    secondary = lookup_ipwhois(target)
+    cache_set(target, {"primary": primary, "secondary": secondary})
+
+    return primary, secondary, False
+
+
+def compare_geo_sources(primary: dict, secondary: dict) -> dict:
+    fields = ["land", "region", "stadt", "isp", "organisation", "as"]
+    matches = {}
+
+    for field in fields:
+        matches[field] = str(primary.get(field, "-")).strip().lower() == str(secondary.get(field, "-")).strip().lower()
+
+    score = sum(1 for value in matches.values() if value)
+    if score >= 5:
+        confidence = "hoch"
+    elif score >= 3:
+        confidence = "mittel"
+    else:
+        confidence = "niedrig"
+
+    return {"treffer": matches, "score": score, "vertrauen": confidence}
+
+
+def get_network_type(geo_data: dict) -> str:
+    if geo_data.get("hosting"):
+        return "Hosting / Rechenzentrum"
+    if geo_data.get("proxy"):
+        return "Proxy / VPN / Relay moeglich"
+    if geo_data.get("mobile"):
+        return "Mobiles Netz"
+    return "Normales Netz / unbekannt"
+
+
+def detect_provider(org: str, isp: str, asn: str, reverse_dns: str) -> dict:
+    haystack = " ".join([org or "", isp or "", asn or "", reverse_dns or ""]).lower()
+
+    patterns = [
+        ("Cloudflare", "CDN / Edge", ["cloudflare"]),
+        ("Fastly", "CDN / Edge", ["fastly"]),
+        ("Akamai", "CDN / Edge", ["akamai"]),
+        ("Amazon Web Services", "Cloud / Hosting", ["amazon", "aws", "amazon web services"]),
+        ("Google Cloud / Google", "Cloud / Edge", ["google", "1e100", "googleusercontent"]),
+        ("Microsoft Azure", "Cloud / Hosting", ["microsoft", "azure"]),
+        ("Hetzner", "Hosting", ["hetzner"]),
+        ("OVH", "Hosting", ["ovh"]),
+        ("DigitalOcean", "Hosting", ["digitalocean"]),
+        ("Linode / Akamai", "Hosting / Cloud", ["linode"]),
+        ("GitHub", "Platform / Edge", ["github"]),
+        ("Oracle Cloud", "Cloud / Hosting", ["oracle"]),
+        ("Mullvad", "VPN / Privacy", ["mullvad"]),
+        ("NordVPN", "VPN", ["nordvpn"]),
+        ("Surfshark", "VPN", ["surfshark"]),
+        ("Proton", "VPN / Privacy", ["proton"]),
+    ]
+
+    for name, kind, keys in patterns:
+        if any(key in haystack for key in keys):
+            return {"provider": name, "typ": kind}
+
+    return {"provider": "-", "typ": "Unbekannt / nicht erkannt"}
+
+
+def vpn_proxy_assessment(primary: dict, secondary: dict, provider: dict) -> dict:
+    score = 0
+    reasons = []
+
+    if primary.get("proxy"):
+        score += 2
+        reasons.append("ip-api meldet Proxy/VPN-Verdacht")
+    if primary.get("hosting"):
+        score += 1
+        reasons.append("IP wirkt wie Hosting/Rechenzentrum")
+    if primary.get("mobile"):
+        reasons.append("mobiles Netz erkannt")
+    if "vpn" in provider.get("typ", "").lower():
+        score += 2
+        reasons.append(f"Provider-Typ deutet auf {provider.get('typ')}")
+    if provider.get("provider", "").lower() in {"mullvad", "nordvpn", "surfshark", "proton"}:
+        score += 2
+        reasons.append(f"VPN-Anbieter erkannt: {provider.get('provider')}")
+
+    org2 = str(secondary.get("organisation", "")).lower()
+    if any(x in org2 for x in ["vpn", "privacy", "proxy"]):
+        score += 1
+        reasons.append("sekundäre Quelle deutet auf VPN/Proxy")
+
+    if score >= 4:
+        level = "hoch"
+    elif score >= 2:
+        level = "mittel"
+    else:
+        level = "niedrig"
+
+    return {
+        "verdacht": level,
+        "gruende": reasons or ["keine starken VPN-/Proxy-Indikatoren erkannt"],
+    }
+
+
+# =========================
+# whois / ping / trace
+# =========================
+def run_whois(target: str) -> str:
+    whois_path = shutil.which("whois")
+    if not whois_path:
+        return "whois ist auf diesem System nicht verfügbar."
+
+    try:
+        result = subprocess.run(
+            [whois_path, target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "whois Timeout."
+    except Exception as exc:
+        return f"whois Fehler: {exc}"
+
+    output = (result.stdout or "").strip()
+    if not output:
+        return "Keine whois Ausgabe erhalten."
+
+    lines = []
+    prefixes = (
+        "OrgName:", "org-name:", "org:", "Organization:", "organisation:",
+        "netname:", "NetName:", "descr:", "country:", "Country:", "origin:",
+        "OriginAS:", "originas:", "CIDR:", "route:", "route6:", "inetnum:",
+        "inet6num:", "owner:", "abuse-mailbox:", "address:"
+    )
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%") or stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefixes):
+            lines.append(stripped)
+        if len(lines) >= 20:
+            break
+
+    return "\n".join(lines) if lines else "Keine kompakten whois Felder gefunden."
+
+
+def run_ping(target: str) -> dict:
+    ping_path = shutil.which("ping")
+    ping6_path = shutil.which("ping6")
+    is_v6 = ":" in target
+
+    if is_v6 and ping6_path:
+        cmd = [ping6_path, "-c", "3", target]
+    elif ping_path:
+        cmd = [ping_path, "-c", "3", target]
+    else:
+        return {"status": "error", "message": "ping ist auf diesem System nicht verfügbar."}
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "ping Timeout."}
+    except Exception as exc:
+        return {"status": "error", "message": f"ping Fehler: {exc}"}
+
+    output = ((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")).strip()
+    packet_line = ""
+    rtt_line = ""
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "packets transmitted" in stripped:
+            packet_line = stripped
+        if "round-trip min/avg/max" in stripped or "rtt min/avg/max" in stripped:
+            rtt_line = stripped
+
+    if result.returncode != 0 and not packet_line:
+        return {"status": "error", "message": output or "ping fehlgeschlagen."}
+
+    return {"status": "ok", "packets": packet_line or "-", "rtt": rtt_line or "-"}
+
+
+def run_traceroute(target: str) -> dict:
+    traceroute_path = shutil.which("traceroute")
+    if not traceroute_path:
+        return {"status": "error", "message": "traceroute ist auf diesem System nicht verfügbar."}
+
+    try:
+        result = subprocess.run(
+            [traceroute_path, "-m", "12", target],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "traceroute Timeout."}
+    except Exception as exc:
+        return {"status": "error", "message": f"traceroute Fehler: {exc}"}
+
+    output = (result.stdout or "").strip()
+    if not output:
+        return {"status": "error", "message": "Keine traceroute Ausgabe erhalten."}
+
+    return {"status": "ok", "lines": output.splitlines()[:15]}
+
+
+# =========================
+# ports / service detection
+# =========================
+COMMON_SERVICES = {
+    21: "ftp",
+    22: "ssh",
+    25: "smtp",
+    53: "dns",
+    80: "http",
+    110: "pop3",
+    143: "imap",
+    443: "https",
+    465: "smtps",
+    587: "submission",
+    993: "imaps",
+    995: "pop3s",
+    3306: "mysql",
+    5432: "postgresql",
+    6379: "redis",
+    8080: "http-alt",
+    8443: "https-alt",
+}
+
+
+def parse_ports(port_text: str | None) -> list[int] | None:
+    if not port_text:
+        return None
+
+    ports = []
+    for item in port_text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        port = int(item)
+        if not 1 <= port <= 65535:
+            raise ValueError(f"Ungültiger Port: {port}")
+        ports.append(port)
+
+    return ports or None
+
+
+def guess_service(port: int, banner: str) -> str:
+    low = banner.lower()
+
+    if "ssh-" in low:
+        return "ssh"
+    if "smtp" in low:
+        return "smtp"
+    if "http/" in low or "server:" in low or "html" in low:
+        return "http"
+    if "redis" in low:
+        return "redis"
+    if "mysql" in low:
+        return "mysql"
+
+    return COMMON_SERVICES.get(port, "-")
+
+
+def try_banner(ip: str, port: int, timeout: float = 1.5) -> tuple[str, str]:
+    try:
+        infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return "-", "-"
+
+    for info in infos:
+        af, socktype, proto, _, sockaddr = info
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(timeout)
+            if sock.connect_ex(sockaddr) != 0:
+                sock.close()
+                continue
+
+            if port in (80, 8080):
+                sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            elif port in (25, 110, 143, 21):
+                pass
+            elif port in (443, 8443):
+                return "https", "TLS Dienst erkannt"
+
+            data = sock.recv(256)
+            banner = data.decode("utf-8", errors="replace").strip()
+            return guess_service(port, banner), banner[:200] if banner else "-"
+        except Exception:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+
+    return COMMON_SERVICES.get(port, "-"), "-"
+
+
+def check_ports(ip: str, ports: list[int], timeout: float = 1.5) -> list[dict]:
+    results = []
+
+    for port in ports:
+        status = "closed"
+        banner = "-"
+        service = "-"
+        sock = None
+
+        try:
+            infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
+            for info in infos:
+                af, socktype, proto, _, sockaddr = info
+                sock = socket.socket(af, socktype, proto)
+                sock.settimeout(timeout)
+                if sock.connect_ex(sockaddr) == 0:
+                    status = "open"
+                    sock.close()
+                    sock = None
+                    service, banner = try_banner(ip, port, timeout)
+                    break
+                sock.close()
+                sock = None
+        except Exception:
+            status = "error"
+        finally:
+            if sock is not None:
+                sock.close()
+
+        results.append({
+            "port": port,
+            "status": status,
+            "service": service,
+            "banner": banner,
+        })
+
+    return results
+
+
+# =========================
+# tls
+# =========================
+def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float = 3.0) -> dict:
+    server_name = hostname or ip
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=server_name) as ssock:
+                cert = ssock.getpeercert()
+                cipher = ssock.cipher()
+                version = ssock.version()
+
+        subject = dict(x[0] for x in cert.get("subject", [])) if cert.get("subject") else {}
+        issuer = dict(x[0] for x in cert.get("issuer", [])) if cert.get("issuer") else {}
+
+        sans = []
+        for san in cert.get("subjectAltName", []):
+            if len(san) == 2 and san[0] == "DNS":
+                sans.append(san[1])
+
+        return {
+            "status": "ok",
+            "tls_version": version or "-",
+            "cipher": cipher[0] if cipher else "-",
+            "subject_cn": subject.get("commonName", "-"),
+            "issuer_cn": issuer.get("commonName", "-"),
+            "not_before": cert.get("notBefore", "-"),
+            "not_after": cert.get("notAfter", "-"),
+            "san_dns": sans[:20],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
+
+
+# =========================
+# export
+# =========================
+def export_results(path: str, results: list[dict]) -> None:
+    target = Path(path)
+    suffix = target.suffix.lower()
+
+    if suffix == ".json":
+        target.write_text(
+            json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return
+
+    if suffix == ".csv":
+        rows = []
+        for result in results:
+            dns = result["dns"]
+            geo = result["geoip"]["primaer"]
+            rows.append({
+                "eingabe": result["eingabe"],
+                "typ": result["typ"],
+                "bevorzugte_ip": dns["bevorzugte_ip"],
+                "reverse_dns": dns["reverse_dns_lokal"],
+                "land": geo.get("land", "-"),
+                "region": geo.get("region", "-"),
+                "stadt": geo.get("stadt", "-"),
+                "isp": geo.get("isp", "-"),
+                "organisation": geo.get("organisation", "-"),
+                "as": geo.get("as", "-"),
+                "provider": geo.get("provider_erkannt", "-"),
+                "vpn_verdacht": geo.get("vpn_proxy_verdacht", {}).get("verdacht", "-"),
+            })
+
+        with target.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["eingabe"])
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return
+
+    if suffix == ".md":
+        lines = ["# woist Report", ""]
+        for result in results:
+            dns = result["dns"]
+            geo = result["geoip"]["primaer"]
+            lines.append(f"## {result['eingabe']}")
+            lines.append("")
+            lines.append(f"- Typ: {result['typ']}")
+            lines.append(f"- Bevorzugte IP: {dns['bevorzugte_ip']}")
+            lines.append(f"- Reverse DNS: {dns['reverse_dns_lokal']}")
+            lines.append(f"- Land: {geo.get('land', '-')}")
+            lines.append(f"- Region: {geo.get('region', '-')}")
+            lines.append(f"- Stadt: {geo.get('stadt', '-')}")
+            lines.append(f"- ISP: {geo.get('isp', '-')}")
+            lines.append(f"- Organisation: {geo.get('organisation', '-')}")
+            lines.append(f"- AS: {geo.get('as', '-')}")
+            lines.append(f"- Provider: {geo.get('provider_erkannt', '-')}")
+            lines.append(f"- VPN/Proxy-Verdacht: {geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}")
+            lines.append("")
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    raise ValueError("Nicht unterstütztes Exportformat. Nutze .json, .csv oder .md")
+
+
+# =========================
+# result building
+# =========================
+def build_result(
+    dns_result: dict,
+    geo_primary: dict,
+    geo_secondary: dict,
+    whois_text: str | None,
+    ping_data: dict | None,
+    trace_data: dict | None,
+    port_data: list[dict] | None,
+    tls_data: dict | None,
+    cache_hit: bool,
+) -> dict:
+    geo_compare = compare_geo_sources(geo_primary, geo_secondary)
+    provider = detect_provider(
+        geo_primary.get("organisation", "-"),
+        geo_primary.get("isp", "-"),
+        geo_primary.get("as", "-"),
+        dns_result.get("reverse_dns", "-"),
+    )
+    vpn_assessment = vpn_proxy_assessment(geo_primary, geo_secondary, provider)
+
+    geo_primary["netztyp"] = get_network_type(geo_primary)
+    geo_primary["provider_erkannt"] = provider["provider"]
+    geo_primary["provider_typ"] = provider["typ"]
+    geo_primary["vpn_proxy_verdacht"] = vpn_assessment
+
+    return {
+        "eingabe": dns_result["eingabe"],
+        "typ": dns_result["typ"],
+        "hostname": dns_result["hostname"],
+        "cache_hit": cache_hit,
+        "dns": {
+            "cname": dns_result["cname"],
+            "a": dns_result["a"],
+            "aaaa": dns_result["aaaa"],
+            "mx": dns_result["mx"],
+            "ns": dns_result["ns"],
+            "txt": dns_result["txt"],
+            "ttl": dns_result["ttl"],
+            "bevorzugte_ip": dns_result["bevorzugte_ip"],
+            "reverse_dns_lokal": dns_result["reverse_dns"],
+        },
+        "geoip": {
+            "hinweis": "GeoIP ist nur eine Schätzung und nicht der exakte physische Serverstandort.",
+            "primaer": geo_primary,
+            "sekundaer": geo_secondary,
+            "vergleich": geo_compare,
+        },
+        "whois": whois_text,
+        "ping": ping_data,
+        "trace": trace_data,
+        "ports": port_data,
+        "tls": tls_data,
+    }
+
+
+def analyze_target(
+    target: str,
+    nameserver: str | None,
+    with_whois: bool,
+    with_ping: bool,
+    with_trace: bool,
+    with_tls: bool,
+    ports: list[int] | None,
+) -> dict:
+    dns_result = resolve_target(target, nameserver)
+    geo_primary, geo_secondary, cache_hit = lookup_geo_with_cache(dns_result["bevorzugte_ip"])
+    whois_text = run_whois(dns_result["bevorzugte_ip"]) if with_whois else None
+    ping_data = run_ping(dns_result["bevorzugte_ip"]) if with_ping else None
+    trace_data = run_traceroute(dns_result["bevorzugte_ip"]) if with_trace else None
+    port_data = check_ports(dns_result["bevorzugte_ip"], ports) if ports else None
+    tls_data = tls_analysis(dns_result["hostname"], dns_result["bevorzugte_ip"]) if with_tls else None
+
+    return build_result(
+        dns_result=dns_result,
+        geo_primary=geo_primary,
+        geo_secondary=geo_secondary,
+        whois_text=whois_text,
+        ping_data=ping_data,
+        trace_data=trace_data,
+        port_data=port_data,
+        tls_data=tls_data,
+        cache_hit=cache_hit,
+    )
+
+
+# =========================
+# output
+# =========================
+def print_dns_block(result: dict, show_preferred_ip: bool, show_all: bool, use_color: bool) -> None:
+    dns = result["dns"]
+
+    print(f"{style('Eingabe:', BOLD + CYAN, use_color)} {result['eingabe']}")
+    print(f"{style('Typ:', BOLD + CYAN, use_color)}     {'Hostname' if result['hostname'] else 'IP-Adresse'}")
+    print(f"{style('Cache:', BOLD + CYAN, use_color)}   {'Treffer' if result['cache_hit'] else 'neu geladen'}")
+
+    if dns["cname"]:
+        print(f"{style('CNAME:', BOLD + YELLOW, use_color)}")
+        for item in dns["cname"]:
+            print(f"  {item}")
+
+    if show_preferred_ip:
+        print(f"{style('Bevorzugte IP:', BOLD + CYAN, use_color)} {dns['bevorzugte_ip']}")
+
+    if show_all or result["typ"] == "hostname":
+        print(f"{style('A (IPv4):', BOLD + GREEN, use_color)}")
+        for x in dns["a"] or ["-"]:
+            print(f"  {x}")
+
+        print(f"{style('AAAA (IPv6):', BOLD + GREEN, use_color)}")
+        for x in dns["aaaa"] or ["-"]:
+            print(f"  {x}")
+
+        print(f"{style('MX:', BOLD + GREEN, use_color)}")
+        for x in dns["mx"] or ["-"]:
+            print(f"  {x}")
+
+        print(f"{style('NS:', BOLD + GREEN, use_color)}")
+        for x in dns["ns"] or ["-"]:
+            print(f"  {x}")
+
+        print(f"{style('TXT:', BOLD + GREEN, use_color)}")
+        for item in (dns["txt"][:10] if dns["txt"] else ["-"]):
+            print(f"  {item}")
+
+        print(f"{style('TTL:', BOLD + GREEN, use_color)}")
+        for key, value in dns["ttl"].items():
+            print(f"  {key}: {value if value is not None else '-'}")
+
+    print(f"{style('Reverse DNS lokal:', BOLD + GREEN, use_color)} {dns['reverse_dns_lokal']}")
+
+
+def print_geo_block(result: dict, use_color: bool) -> None:
+    geo = result["geoip"]
+    p = geo["primaer"]
+    s = geo["sekundaer"]
+    c = geo["vergleich"]
+    v = p.get("vpn_proxy_verdacht", {})
+
+    print(f"{style('GeoIP-Schaetzung:', BOLD + YELLOW, use_color)}")
+    print(f"  Hinweis:            {geo['hinweis']}")
+    print(f"  Ziel-IP:            {p.get('ziel_ip', '-')}")
+    print(f"  Land:               {p.get('land', '-')}")
+    print(f"  Region:             {p.get('region', '-')}")
+    print(f"  Stadt:              {p.get('stadt', '-')}")
+    print(f"  PLZ:                {p.get('plz', '-')}")
+    print(f"  Breitengrad:        {p.get('breitengrad', '-')}")
+    print(f"  Laengengrad:        {p.get('laengengrad', '-')}")
+    print(f"  Zeitzone:           {p.get('zeitzone', '-')}")
+    print(f"  ISP:                {p.get('isp', '-')}")
+    print(f"  Organisation:       {p.get('organisation', '-')}")
+    print(f"  AS:                 {p.get('as', '-')}")
+    print(f"  Reverse DNS API:    {p.get('reverse_dns_api', '-')}")
+    print(f"  Netztyp:            {p.get('netztyp', '-')}")
+    print(f"  Provider erkannt:   {p.get('provider_erkannt', '-')}")
+    print(f"  Provider-Typ:       {p.get('provider_typ', '-')}")
+    print(f"  VPN/Proxy-Verdacht: {v.get('verdacht', '-')}")
+    for reason in v.get("gruende", []):
+        print(f"    - {reason}")
+
+    print(f"{style('GeoIP-Vergleich:', BOLD + MAGENTA, use_color)}")
+    print(f"  Primaerquelle:      {p.get('quelle', '-')}")
+    print(f"  Sekundaerquelle:    {s.get('quelle', '-')}")
+    print(f"  Vertrauen:          {c.get('vertrauen', '-')}")
+    print(f"  Score:              {c.get('score', '-')}/6")
+
+
+def print_tls_block(tls_data: dict | None, use_color: bool) -> None:
+    if tls_data is None:
+        return
+
+    print(f"{style('TLS/HTTPS:', BOLD + MAGENTA, use_color)}")
+    if tls_data.get("status") != "ok":
+        print(f"  Fehler: {tls_data.get('message', '-')}")
+        return
+
+    print(f"  TLS-Version:   {tls_data.get('tls_version', '-')}")
+    print(f"  Cipher:        {tls_data.get('cipher', '-')}")
+    print(f"  Subject CN:    {tls_data.get('subject_cn', '-')}")
+    print(f"  Issuer CN:     {tls_data.get('issuer_cn', '-')}")
+    print(f"  Gueltig ab:    {tls_data.get('not_before', '-')}")
+    print(f"  Gueltig bis:   {tls_data.get('not_after', '-')}")
+    print(f"  SAN DNS:")
+    for item in tls_data.get("san_dns", []) or ["-"]:
+        print(f"    {item}")
+
+
+def print_whois_block(whois_text: str | None, use_color: bool) -> None:
+    if whois_text is None:
+        return
+
+    print(f"{style('Whois:', BOLD + MAGENTA, use_color)}")
+    for line in whois_text.splitlines():
+        print(f"  {line}")
+
+
+def print_ping_block(ping_data: dict | None, use_color: bool) -> None:
+    if ping_data is None:
+        return
+
+    print(f"{style('Ping:', BOLD + MAGENTA, use_color)}")
+    if ping_data.get("status") == "ok":
+        print(f"  Pakete: {ping_data.get('packets', '-')}")
+        print(f"  RTT:    {ping_data.get('rtt', '-')}")
+    else:
+        print(f"  {ping_data.get('message', 'ping fehlgeschlagen.')}")
+
+
+def print_trace_block(trace_data: dict | None, use_color: bool) -> None:
+    if trace_data is None:
+        return
+
+    print(f"{style('Traceroute:', BOLD + MAGENTA, use_color)}")
+    if trace_data.get("status") == "ok":
+        for line in trace_data.get("lines", []):
+            print(f"  {line}")
+    else:
+        print(f"  {trace_data.get('message', 'traceroute fehlgeschlagen.')}")
+
+
+def print_ports_block(port_data: list[dict] | None, use_color: bool) -> None:
+    if port_data is None:
+        return
+
+    print(f"{style('Ports:', BOLD + MAGENTA, use_color)}")
+    for item in port_data:
+        print(
+            f"  {item['port']}: {item['status']} | "
+            f"Service: {item.get('service', '-')} | "
+            f"Banner: {item.get('banner', '-')}"
+        )
+
+
+def print_table_block(result: dict) -> None:
+    dns = result["dns"]
+    geo = result["geoip"]["primaer"]
+
+    rows = [
+        ("Eingabe", result["eingabe"]),
+        ("Typ", "Hostname" if result["hostname"] else "IP-Adresse"),
+        ("Cache", "Treffer" if result["cache_hit"] else "neu geladen"),
+        ("Bevorzugte IP", dns["bevorzugte_ip"]),
+        ("Reverse DNS", dns["reverse_dns_lokal"]),
+        ("Land", geo.get("land", "-")),
+        ("Region", geo.get("region", "-")),
+        ("Stadt", geo.get("stadt", "-")),
+        ("ISP", geo.get("isp", "-")),
+        ("Organisation", geo.get("organisation", "-")),
+        ("AS", geo.get("as", "-")),
+        ("Provider", geo.get("provider_erkannt", "-")),
+        ("Netztyp", geo.get("netztyp", "-")),
+        ("VPN/Proxy-Verdacht", geo.get("vpn_proxy_verdacht", {}).get("verdacht", "-")),
+    ]
+
+    width = max(len(k) for k, _ in rows)
+    for key, value in rows:
+        print(f"{key:<{width}} : {value}")
+
+
+def print_compact_block(result: dict) -> None:
+    dns = result["dns"]
+    geo = result["geoip"]["primaer"]
+
+    print(
+        f"{result['eingabe']} | "
+        f"IP={dns['bevorzugte_ip']} | "
+        f"Land={geo.get('land', '-')} | "
+        f"Region={geo.get('region', '-')} | "
+        f"Stadt={geo.get('stadt', '-')} | "
+        f"ISP={geo.get('isp', '-')} | "
+        f"AS={geo.get('as', '-')} | "
+        f"Provider={geo.get('provider_erkannt', '-')} | "
+        f"VPN={geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}"
+    )
+
+
+def print_cache_info() -> None:
+    stats = cache_stats()
+    print(f"Cache-Datei:      {stats['datei']}")
+    print(f"Eintraege:        {stats['eintraege']}")
+    print(f"Aelteste UNIX:    {stats['aelteste_unix']}")
+    print(f"Neueste UNIX:     {stats['neuste_unix']}")
+
+
+HELP_TEXT = f"""woist {APP_VERSION}
+
+Kurzbeschreibung:
+  CLI-Tool zur Analyse von IPs, Domains und URLs.
+  Es kombiniert DNS, GeoIP, Whois, Ping, Traceroute, Portcheck und TLS-Analyse.
+
+Aufruf:
+  woist [OPTIONEN] ziel
+  woist [OPTIONEN] ziel1 ziel2 ziel3
+  woist [OPTIONEN] --file datei.txt
+
+Wichtige Befehle / Optionen:
+  -h, --help, -help     Zeigt diesen Hilfebereich mit allen Befehlen an
+  --json                Gibt die Ausgabe als JSON aus
+  --compact             Kompakte Ein-Zeilen-Ausgabe
+  --table               Tabellarische Kurz-Ausgabe
+  --raw                 Ausgabe ohne Styling / ohne Farben
+  --no-color            Deaktiviert Farbausgabe
+
+Ziele:
+  ziel                  IP-Adresse, Domain oder URL
+  --file DATEI          Liest mehrere Ziele aus einer Datei
+
+DNS:
+  --dns IP              Nutzt einen bestimmten DNS-Server für Abfragen
+  --ip                  Zeigt die bevorzugte aufgelöste IP an
+  --all                 Zeigt alle gefundenen DNS-Daten an
+
+GeoIP / Cache:
+  --cache-info          Zeigt Infos zum lokalen Cache
+  --clear-cache         Löscht den lokalen Cache
+
+Netzwerk:
+  --whois               Zeigt kompakte Whois-Daten
+  --ping                Führt einen kurzen Ping aus
+  --trace               Führt ein kurzes Traceroute aus
+  --ports LISTE         Prüft TCP-Ports, z. B. 80,443,22
+  --tls                 Führt TLS-/HTTPS-Zertifikatsanalyse aus
+
+Export:
+  --out DATEI           Exportiert Ergebnis nach .json, .csv oder .md
+
+Beispiele:
+  woist github.com
+  woist --all github.com
+  woist --dns 8.8.8.8 github.com
+  woist --whois --ping github.com
+  woist --trace --ports 80,443 github.com
+  woist --tls github.com
+  woist --file targets.txt --compact
+  woist --out report.json github.com
+  woist --out report.csv github.com
+  woist --out report.md github.com
+"""
+
+
+# =========================
+# cli
+# =========================
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Zeigt den ungefähren Standort zu einer IP-Adresse oder URL an."
-    )
-    parser.add_argument("ziel", help="IP-Adresse, URL oder Hostname")
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        help="Ausgabe als JSON",
-    )
-    parser.add_argument(
-        "--ip",
-        action="store_true",
-        help="Zeigt die aufgelöste Ziel-IP zusätzlich an",
-    )
+    if any(arg in ("-h", "--help", "-help") for arg in sys.argv[1:]):
+        print(HELP_TEXT)
+        return 0
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("ziele", nargs="*", help="IP-Adresse, URL oder Hostname")
+    parser.add_argument("--file", help="liest zusätzliche Ziele aus einer Datei")
+    parser.add_argument("--dns", dest="dns_server", help="nutzt diesen DNS-Server für Abfragen")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="gibt die Ausgabe als JSON aus")
+    parser.add_argument("--ip", action="store_true", help="zeigt die bevorzugte aufgelöste IP an")
+    parser.add_argument("--all", action="store_true", help="zeigt alle gefundenen DNS-Daten an")
+    parser.add_argument("--whois", action="store_true", help="zeigt eine kompakte whois-Auswertung an")
+    parser.add_argument("--ping", action="store_true", help="führt einen kurzen Ping auf die bevorzugte IP aus")
+    parser.add_argument("--trace", action="store_true", help="führt ein kurzes traceroute aus")
+    parser.add_argument("--ports", help="prüft TCP-Ports, z. B. 80,443,22")
+    parser.add_argument("--tls", action="store_true", help="führt TLS-/HTTPS-Zertifikatsanalyse aus")
+    parser.add_argument("--compact", action="store_true", help="kompakte Ein-Zeilen-Ausgabe")
+    parser.add_argument("--table", action="store_true", help="tabellarische Kurz-Ausgabe")
+    parser.add_argument("--raw", action="store_true", help="zeigt Rohdaten ohne Styling")
+    parser.add_argument("--no-color", action="store_true", help="deaktiviert Farbausgabe")
+    parser.add_argument("--out", help="exportiert Ergebnis nach .json, .csv oder .md")
+    parser.add_argument("--cache-info", action="store_true", help="zeigt Infos zum lokalen Cache")
+    parser.add_argument("--clear-cache", action="store_true", help="löscht den lokalen Cache")
     args = parser.parse_args()
 
     try:
-        original, resolved_ip = resolve_target(args.ziel)
-        data = lookup_ip(resolved_ip)
-        result = build_result(original, resolved_ip, data)
+        if args.clear_cache:
+            removed = clear_cache()
+            print("Cache gelöscht." if removed else "Kein Cache vorhanden.")
+            return 0
+
+        if args.cache_info:
+            print_cache_info()
+            return 0
+
+        if args.dns_server:
+            ipaddress.ip_address(args.dns_server)
+
+        ports = parse_ports(args.ports)
+        targets = read_targets(args.ziele, args.file)
+
+        results = []
+        for target in targets:
+            results.append(
+                analyze_target(
+                    target=target,
+                    nameserver=args.dns_server,
+                    with_whois=args.whois,
+                    with_ping=args.ping,
+                    with_trace=args.trace,
+                    with_tls=args.tls,
+                    ports=ports,
+                )
+            )
+
+        if args.out:
+            export_results(args.out, results)
 
         if args.json_output:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-        else:
-            print_text_result(result, show_resolved=args.ip)
+            print(json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2))
+            return 0
+
+        use_color = not args.no_color and not args.raw
+
+        for index, result in enumerate(results, start=1):
+            if len(results) > 1:
+                header = f"[{index}/{len(results)}] {result['eingabe']}"
+                print(style(header, BOLD + CYAN, use_color))
+
+            if args.compact:
+                print_compact_block(result)
+            elif args.table:
+                print_table_block(result)
+                if args.whois:
+                    print()
+                    print_whois_block(result["whois"], use_color=False)
+                if args.ping:
+                    print()
+                    print_ping_block(result["ping"], use_color=False)
+                if args.trace:
+                    print()
+                    print_trace_block(result["trace"], use_color=False)
+                if ports:
+                    print()
+                    print_ports_block(result["ports"], use_color=False)
+                if args.tls:
+                    print()
+                    print_tls_block(result["tls"], use_color=False)
+            else:
+                print_dns_block(result, show_preferred_ip=args.ip, show_all=args.all, use_color=use_color)
+                print()
+                print_geo_block(result, use_color=use_color)
+
+                if args.tls:
+                    print()
+                    print_tls_block(result["tls"], use_color=use_color)
+
+                if args.whois:
+                    print()
+                    print_whois_block(result["whois"], use_color=use_color)
+
+                if args.ping:
+                    print()
+                    print_ping_block(result["ping"], use_color=use_color)
+
+                if args.trace:
+                    print()
+                    print_trace_block(result["trace"], use_color=use_color)
+
+                if ports:
+                    print()
+                    print_ports_block(result["ports"], use_color=use_color)
+
+            if len(results) > 1 and index < len(results):
+                print()
 
         return 0
+
     except KeyboardInterrupt:
-        print("Abbruch durch Benutzer.", file=sys.stderr)
+        print("Fehler: Abbruch durch Benutzer.", file=sys.stderr)
         return 130
     except ValueError as exc:
         print(f"Fehler: {exc}", file=sys.stderr)
