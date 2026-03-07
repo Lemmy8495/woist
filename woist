@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import csv
 import ipaddress
 import json
@@ -26,7 +27,7 @@ except ImportError:
     sys.exit(1)
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "6.0.1"
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -42,10 +43,73 @@ IP_API_URL = (
     "isp,org,as,reverse,hosting,proxy,mobile"
 )
 IPWHO_URL = "https://ipwho.is/{target}"
+CRT_SH_URL = "https://crt.sh/?q=%25.{domain}&output=json"
 
 CACHE_DIR = Path.home() / ".cache" / "woist"
 CACHE_FILE = CACHE_DIR / "geoip_cache.json"
 CACHE_TTL = 60 * 60 * 24  # 24 Stunden
+
+DEFAULT_THREADS = 8
+
+COMMON_SERVICES = {
+    21: "ftp",
+    22: "ssh",
+    25: "smtp",
+    53: "dns",
+    80: "http",
+    110: "pop3",
+    143: "imap",
+    443: "https",
+    465: "smtps",
+    587: "submission",
+    993: "imaps",
+    995: "pop3s",
+    3306: "mysql",
+    5432: "postgresql",
+    6379: "redis",
+    8080: "http-alt",
+    8443: "https-alt",
+}
+
+COMMON_SUBDOMAIN_WORDS = [
+    "www",
+    "api",
+    "mail",
+    "smtp",
+    "imap",
+    "pop",
+    "m",
+    "mobile",
+    "dev",
+    "test",
+    "staging",
+    "beta",
+    "app",
+    "apps",
+    "cdn",
+    "static",
+    "assets",
+    "img",
+    "media",
+    "files",
+    "docs",
+    "status",
+    "portal",
+    "admin",
+    "auth",
+    "login",
+    "git",
+    "blog",
+    "support",
+    "vpn",
+    "ns1",
+    "ns2",
+]
+
+DNSBL_ZONES = [
+    ("Spamhaus ZEN", "zen.spamhaus.org"),
+    ("SORBS", "dnsbl.sorbs.net"),
+]
 
 
 def style(text: str, color: str, use_color: bool) -> str:
@@ -108,6 +172,50 @@ def read_targets(single_targets: list[str], file_path: str | None) -> list[str]:
         raise ValueError("Keine Ziele angegeben.")
 
     return targets
+
+
+def parse_ports(value: str | None) -> list[int] | None:
+    if value is None:
+        return None
+
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Portliste ist leer.")
+
+    ports: list[int] = []
+
+    for raw_part in cleaned.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("Ungültige Portliste: leere Elemente sind nicht erlaubt.")
+
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            if not start_raw.isdigit() or not end_raw.isdigit():
+                raise ValueError(f"Ungültiger Portbereich: {part}")
+
+            start = int(start_raw)
+            end = int(end_raw)
+            if start > end:
+                raise ValueError(f"Ungültiger Portbereich: {part}")
+            if start < 1 or end > 65535:
+                raise ValueError(f"Port außerhalb des gültigen Bereichs (1-65535): {part}")
+
+            ports.extend(range(start, end + 1))
+            continue
+
+        if not part.isdigit():
+            raise ValueError(f"Ungültiger Port: {part}")
+
+        port = int(part)
+        if port < 1 or port > 65535:
+            raise ValueError(f"Port außerhalb des gültigen Bereichs (1-65535): {part}")
+        ports.append(port)
+
+    if not ports:
+        raise ValueError("Portliste ist leer.")
+
+    return sorted(set(ports))
 
 
 def load_cache() -> dict:
@@ -268,11 +376,11 @@ def resolve_target(value: str, nameserver: str | None) -> dict:
     }
 
 
-def http_json(url: str, user_agent: str) -> dict:
+def http_json(url: str, user_agent: str) -> dict | list:
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"HTTP-Fehler bei API-Abfrage: {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -283,8 +391,8 @@ def http_json(url: str, user_agent: str) -> dict:
 
 def lookup_ip_api(target: str) -> dict:
     data = http_json(IP_API_URL.format(target=urllib.parse.quote(target, safe="")), f"woist/{APP_VERSION}")
-    if data.get("status") != "success":
-        raise RuntimeError(data.get("message", "ip-api Fehler"))
+    if not isinstance(data, dict) or data.get("status") != "success":
+        raise RuntimeError(data.get("message", "ip-api Fehler") if isinstance(data, dict) else "ip-api Fehler")
 
     return {
         "quelle": "ip-api",
@@ -308,8 +416,8 @@ def lookup_ip_api(target: str) -> dict:
 
 def lookup_ipwhois(target: str) -> dict:
     data = http_json(IPWHO_URL.format(target=urllib.parse.quote(target, safe="")), f"woist/{APP_VERSION}")
-    if not data.get("success", False):
-        raise RuntimeError(data.get("message", "ipwho.is Fehler"))
+    if not isinstance(data, dict) or not data.get("success", False):
+        raise RuntimeError(data.get("message", "ipwho.is Fehler") if isinstance(data, dict) else "ipwho.is Fehler")
 
     connection = data.get("connection", {}) or {}
     return {
@@ -527,229 +635,6 @@ def vpn_proxy_assessment(primary: dict, secondary: dict, provider: dict) -> dict
     }
 
 
-def run_ping(target: str) -> dict:
-    ping_path = shutil.which("ping")
-    ping6_path = shutil.which("ping6")
-    is_v6 = ":" in target
-
-    if is_v6 and ping6_path:
-        cmd = [ping6_path, "-c", "3", target]
-    elif ping_path:
-        cmd = [ping_path, "-c", "3", target]
-    else:
-        return {"status": "error", "message": "ping ist auf diesem System nicht verfügbar."}
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "message": "ping Timeout."}
-    except Exception as exc:
-        return {"status": "error", "message": f"ping Fehler: {exc}"}
-
-    output = ((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")).strip()
-    packet_line = ""
-    rtt_line = ""
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        if "packets transmitted" in stripped:
-            packet_line = stripped
-        if "round-trip min/avg/max" in stripped or "rtt min/avg/max" in stripped:
-            rtt_line = stripped
-
-    if result.returncode != 0 and not packet_line:
-        return {"status": "error", "message": output or "ping fehlgeschlagen."}
-
-    return {"status": "ok", "packets": packet_line or "-", "rtt": rtt_line or "-"}
-
-
-def run_traceroute(target: str) -> dict:
-    traceroute_path = shutil.which("traceroute")
-    if not traceroute_path:
-        return {"status": "error", "message": "traceroute ist auf diesem System nicht verfügbar."}
-
-    try:
-        result = subprocess.run(
-            [traceroute_path, "-m", "12", target],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "message": "traceroute Timeout."}
-    except Exception as exc:
-        return {"status": "error", "message": f"traceroute Fehler: {exc}"}
-
-    output = (result.stdout or "").strip()
-    if not output:
-        return {"status": "error", "message": "Keine traceroute Ausgabe erhalten."}
-
-    return {"status": "ok", "lines": output.splitlines()[:15]}
-
-
-COMMON_SERVICES = {
-    21: "ftp",
-    22: "ssh",
-    25: "smtp",
-    53: "dns",
-    80: "http",
-    110: "pop3",
-    143: "imap",
-    443: "https",
-    465: "smtps",
-    587: "submission",
-    993: "imaps",
-    995: "pop3s",
-    3306: "mysql",
-    5432: "postgresql",
-    6379: "redis",
-    8080: "http-alt",
-    8443: "https-alt",
-}
-
-
-def parse_ports(port_text: str | None) -> list[int] | None:
-    if not port_text:
-        return None
-
-    ports = []
-    for item in port_text.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        port = int(item)
-        if not 1 <= port <= 65535:
-            raise ValueError(f"Ungültiger Port: {port}")
-        ports.append(port)
-
-    return ports or None
-
-
-def guess_service(port: int, banner: str) -> str:
-    low = banner.lower()
-
-    if "ssh-" in low:
-        return "ssh"
-    if "smtp" in low:
-        return "smtp"
-    if "http/" in low or "server:" in low or "html" in low:
-        return "http"
-    if "redis" in low:
-        return "redis"
-    if "mysql" in low:
-        return "mysql"
-
-    return COMMON_SERVICES.get(port, "-")
-
-
-def try_banner(ip: str, port: int, timeout: float = 1.5) -> tuple[str, str]:
-    try:
-        infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
-    except Exception:
-        return "-", "-"
-
-    for info in infos:
-        af, socktype, proto, _, sockaddr = info
-        sock = None
-        try:
-            sock = socket.socket(af, socktype, proto)
-            sock.settimeout(timeout)
-            if sock.connect_ex(sockaddr) != 0:
-                sock.close()
-                continue
-
-            if port in (80, 8080):
-                sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-            elif port in (443, 8443):
-                return "https", "TLS Dienst erkannt"
-
-            data = sock.recv(256)
-            banner = data.decode("utf-8", errors="replace").strip()
-            return guess_service(port, banner), banner[:200] if banner else "-"
-        except Exception:
-            continue
-        finally:
-            if sock is not None:
-                sock.close()
-
-    return COMMON_SERVICES.get(port, "-"), "-"
-
-
-def check_ports(ip: str, ports: list[int], timeout: float = 1.5) -> list[dict]:
-    results = []
-
-    for port in ports:
-        status = "closed"
-        banner = "-"
-        service = "-"
-        sock = None
-
-        try:
-            infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
-            for info in infos:
-                af, socktype, proto, _, sockaddr = info
-                sock = socket.socket(af, socktype, proto)
-                sock.settimeout(timeout)
-                if sock.connect_ex(sockaddr) == 0:
-                    status = "open"
-                    sock.close()
-                    sock = None
-                    service, banner = try_banner(ip, port, timeout)
-                    break
-                sock.close()
-                sock = None
-        except Exception:
-            status = "error"
-        finally:
-            if sock is not None:
-                sock.close()
-
-        results.append({
-            "port": port,
-            "status": status,
-            "service": service,
-            "banner": banner,
-        })
-
-    return results
-
-
-def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float = 3.0) -> dict:
-    server_name = hostname or ip
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((ip, port), timeout=timeout) as sock:
-            with context.wrap_socket(sock, server_hostname=server_name) as ssock:
-                cert = ssock.getpeercert()
-                cipher = ssock.cipher()
-                version = ssock.version()
-
-        subject = dict(x[0] for x in cert.get("subject", [])) if cert.get("subject") else {}
-        issuer = dict(x[0] for x in cert.get("issuer", [])) if cert.get("issuer") else {}
-
-        sans = []
-        for san in cert.get("subjectAltName", []):
-            if len(san) == 2 and san[0] == "DNS":
-                sans.append(san[1])
-
-        return {
-            "status": "ok",
-            "tls_version": version or "-",
-            "cipher": cipher[0] if cipher else "-",
-            "subject_cn": subject.get("commonName", "-"),
-            "issuer_cn": issuer.get("commonName", "-"),
-            "not_before": cert.get("notBefore", "-"),
-            "not_after": cert.get("notAfter", "-"),
-            "san_dns": sans[:20],
-        }
-    except Exception as exc:
-        return {
-            "status": "error",
-            "message": str(exc),
-        }
-
-
 def detect_cdn_from_headers(headers: dict[str, str]) -> dict:
     joined = " ".join(f"{k}:{v}" for k, v in headers.items()).lower()
 
@@ -856,6 +741,351 @@ def analyze_http(target: str, hostname: str | None) -> dict:
     }
 
 
+def run_ping(target: str) -> dict:
+    ping_path = shutil.which("ping")
+    ping6_path = shutil.which("ping6")
+    is_v6 = ":" in target
+
+    if is_v6 and ping6_path:
+        cmd = [ping6_path, "-c", "3", target]
+    elif ping_path:
+        cmd = [ping_path, "-c", "3", target]
+    else:
+        return {"status": "error", "message": "ping ist auf diesem System nicht verfügbar."}
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "ping Timeout."}
+    except Exception as exc:
+        return {"status": "error", "message": f"ping Fehler: {exc}"}
+
+    output = ((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")).strip()
+    packet_line = ""
+    rtt_line = ""
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if "packets transmitted" in stripped:
+            packet_line = stripped
+        if "round-trip min/avg/max" in stripped or "rtt min/avg/max" in stripped:
+            rtt_line = stripped
+
+    if result.returncode != 0 and not packet_line:
+        return {"status": "error", "message": output or "ping fehlgeschlagen."}
+
+    return {"status": "ok", "packets": packet_line or "-", "rtt": rtt_line or "-"}
+
+
+def run_traceroute(target: str) -> dict:
+    traceroute_path = shutil.which("traceroute")
+    if not traceroute_path:
+        return {"status": "error", "message": "traceroute ist auf diesem System nicht verfügbar."}
+
+    try:
+        result = subprocess.run(
+            [traceroute_path, "-m", "12", target],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "traceroute Timeout."}
+    except Exception as exc:
+        return {"status": "error", "message": f"traceroute Fehler: {exc}"}
+
+    output = (result.stdout or "").strip()
+    if not output:
+        return {"status": "error", "message": "Keine traceroute Ausgabe erhalten."}
+
+    return {"status": "ok", "lines": output.splitlines()[:15]}
+
+
+def guess_service(port: int, banner: str) -> str:
+    low = banner.lower()
+
+    if "ssh-" in low:
+        return "ssh"
+    if "smtp" in low:
+        return "smtp"
+    if "http/" in low or "server:" in low or "html" in low:
+        return "http"
+    if "redis" in low:
+        return "redis"
+    if "mysql" in low:
+        return "mysql"
+
+    return COMMON_SERVICES.get(port, "-")
+
+
+def try_banner(ip: str, port: int, timeout: float = 1.5) -> tuple[str, str]:
+    try:
+        infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return "-", "-"
+
+    for info in infos:
+        af, socktype, proto, _, sockaddr = info
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(timeout)
+            if sock.connect_ex(sockaddr) != 0:
+                sock.close()
+                continue
+
+            if port in (80, 8080):
+                sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            elif port in (443, 8443):
+                return "https", "TLS Dienst erkannt"
+
+            data = sock.recv(256)
+            banner = data.decode("utf-8", errors="replace").strip()
+            return guess_service(port, banner), banner[:200] if banner else "-"
+        except Exception:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+
+    return COMMON_SERVICES.get(port, "-"), "-"
+
+
+def check_single_port(ip: str, port: int, timeout: float = 1.5) -> dict:
+    status = "closed"
+    banner = "-"
+    service = "-"
+    sock = None
+
+    try:
+        infos = socket.getaddrinfo(ip, port, proto=socket.IPPROTO_TCP)
+        for info in infos:
+            af, socktype, proto, _, sockaddr = info
+            sock = socket.socket(af, socktype, proto)
+            sock.settimeout(timeout)
+            if sock.connect_ex(sockaddr) == 0:
+                status = "open"
+                sock.close()
+                sock = None
+                service, banner = try_banner(ip, port, timeout)
+                break
+            sock.close()
+            sock = None
+    except Exception:
+        status = "error"
+    finally:
+        if sock is not None:
+            sock.close()
+
+    return {
+        "port": port,
+        "status": status,
+        "service": service,
+        "banner": banner,
+    }
+
+
+def check_ports(ip: str, ports: list[int], timeout: float = 1.5, threads: int = DEFAULT_THREADS) -> list[dict]:
+    if not ports:
+        return []
+
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(ports), max(1, threads))) as executor:
+        futures = [executor.submit(check_single_port, ip, port, timeout) for port in ports]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    return sorted(results, key=lambda x: x["port"])
+
+
+def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float = 3.0) -> dict:
+    server_name = hostname or ip
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=server_name) as ssock:
+                cert = ssock.getpeercert()
+                cipher = ssock.cipher()
+                version = ssock.version()
+
+        subject = dict(x[0] for x in cert.get("subject", [])) if cert.get("subject") else {}
+        issuer = dict(x[0] for x in cert.get("issuer", [])) if cert.get("issuer") else {}
+
+        sans = []
+        for san in cert.get("subjectAltName", []):
+            if len(san) == 2 and san[0] == "DNS":
+                sans.append(san[1])
+
+        return {
+            "status": "ok",
+            "tls_version": version or "-",
+            "cipher": cipher[0] if cipher else "-",
+            "subject_cn": subject.get("commonName", "-"),
+            "issuer_cn": issuer.get("commonName", "-"),
+            "not_before": cert.get("notBefore", "-"),
+            "not_after": cert.get("notAfter", "-"),
+            "san_dns": sans[:20],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
+
+
+def normalize_subdomain_name(name: str, domain: str) -> list[str]:
+    names = []
+    for part in str(name).splitlines():
+        item = part.strip().lower().rstrip(".")
+        if not item or "*" in item:
+            continue
+        if item == domain or item.endswith(f".{domain}"):
+            names.append(item)
+    return names
+
+
+def fetch_crtsh_subdomains(domain: str) -> list[str]:
+    try:
+        data = http_json(CRT_SH_URL.format(domain=urllib.parse.quote(domain, safe="")), f"woist/{APP_VERSION}")
+    except Exception:
+        return []
+
+    if not isinstance(data, list):
+        return []
+
+    found = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        found.extend(normalize_subdomain_name(item.get("name_value", ""), domain))
+        found.extend(normalize_subdomain_name(item.get("common_name", ""), domain))
+    return uniq(sorted(found))
+
+
+def resolve_subdomain_candidate(subdomain: str, nameserver: str | None) -> dict | None:
+    a_records, _ = query_dns(subdomain, "A", nameserver)
+    aaaa_records, _ = query_dns(subdomain, "AAAA", nameserver)
+    cname_records, _ = query_dns(subdomain, "CNAME", nameserver)
+
+    if not a_records and not aaaa_records and not cname_records:
+        return None
+
+    return {
+        "name": subdomain,
+        "a": a_records,
+        "aaaa": aaaa_records,
+        "cname": cname_records,
+    }
+
+
+def brute_force_subdomains(domain: str, nameserver: str | None, threads: int) -> list[dict]:
+    candidates = [f"{word}.{domain}" for word in COMMON_SUBDOMAIN_WORDS]
+    found: list[dict] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(candidates), max(1, threads))) as executor:
+        futures = [executor.submit(resolve_subdomain_candidate, candidate, nameserver) for candidate in candidates]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                found.append(result)
+
+    return sorted(found, key=lambda x: x["name"])
+
+
+def discover_subdomains(domain: str, nameserver: str | None, threads: int) -> dict:
+    if is_ip(domain):
+        return {
+            "status": "error",
+            "message": "Subdomain Discovery ist nur für Domains sinnvoll.",
+            "crtsh": [],
+            "bruteforce": [],
+            "gesamt": [],
+        }
+
+    crtsh_results = fetch_crtsh_subdomains(domain)
+    bruteforce_results = brute_force_subdomains(domain, nameserver, threads)
+
+    combined_names = uniq(
+        sorted(
+            crtsh_results + [item["name"] for item in bruteforce_results]
+        )
+    )
+
+    return {
+        "status": "ok",
+        "crtsh": crtsh_results[:100],
+        "bruteforce": bruteforce_results,
+        "gesamt": combined_names[:150],
+    }
+
+
+def dnsbl_query_name(ip: str, zone: str) -> str | None:
+    try:
+        parsed = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+
+    if parsed.version != 4:
+        return None
+
+    reversed_ip = ".".join(reversed(ip.split(".")))
+    return f"{reversed_ip}.{zone}"
+
+
+def check_reputation(ip: str, hostname: str | None, provider_name: str) -> dict:
+    results = []
+    listed_count = 0
+
+    for label, zone in DNSBL_ZONES:
+        query_name = dnsbl_query_name(ip, zone)
+        listed = False
+        response = "-"
+        if query_name:
+            try:
+                answers, _ = query_dns(query_name, "A", None)
+                if answers:
+                    listed = True
+                    listed_count += 1
+                    response = ", ".join(answers)
+            except Exception:
+                response = "-"
+        else:
+            response = "nur IPv4 unterstützt"
+
+        results.append({
+            "quelle": label,
+            "zone": zone,
+            "gelistet": listed,
+            "antwort": response,
+        })
+
+    reasons = []
+    if listed_count > 0:
+        reasons.append("Mindestens eine DNSBL listet diese IPv4-Adresse.")
+    if provider_name not in ("-", "Unbekannt / nicht erkannt"):
+        reasons.append(f"Provider erkannt: {provider_name}")
+    if hostname and any(word in hostname.lower() for word in ["vpn", "proxy", "tor", "relay"]):
+        reasons.append("Hostname enthält VPN/Proxy/Relay-Hinweise.")
+
+    if listed_count >= 2:
+        risk = "hoch"
+    elif listed_count == 1:
+        risk = "mittel"
+    else:
+        risk = "niedrig"
+
+    if not reasons:
+        reasons.append("Keine DNSBL-Treffer in den geprüften Quellen gefunden.")
+
+    return {
+        "status": "ok",
+        "ipv4_dnsbl_checks": results,
+        "risk_score": risk,
+        "reasons": reasons,
+    }
+
+
 def export_results(path: str, results: list[dict]) -> None:
     target = Path(path)
     suffix = target.suffix.lower()
@@ -874,6 +1104,7 @@ def export_results(path: str, results: list[dict]) -> None:
             geo = result["geoip"]["primaer"]
             asn = result["asn"]
             http_data = result.get("http")
+            reputation = result.get("reputation")
             rows.append({
                 "eingabe": result["eingabe"],
                 "typ": result["typ"],
@@ -894,6 +1125,7 @@ def export_results(path: str, results: list[dict]) -> None:
                 "server": http_data.get("server", "-") if http_data else "-",
                 "cdn": http_data.get("cdn", {}).get("name", "-") if http_data else "-",
                 "security_score": http_data.get("security_score", "-") if http_data else "-",
+                "reputation_risk": reputation.get("risk_score", "-") if reputation else "-",
             })
 
         with target.open("w", newline="", encoding="utf-8") as f:
@@ -910,6 +1142,7 @@ def export_results(path: str, results: list[dict]) -> None:
             geo = result["geoip"]["primaer"]
             asn = result["asn"]
             http_data = result.get("http")
+            reputation = result.get("reputation")
             lines.append(f"## {result['eingabe']}")
             lines.append("")
             lines.append(f"- Typ: {result['typ']}")
@@ -931,6 +1164,8 @@ def export_results(path: str, results: list[dict]) -> None:
                 lines.append(f"- Server: {http_data.get('server', '-')}")
                 lines.append(f"- CDN: {http_data.get('cdn', {}).get('name', '-')}")
                 lines.append(f"- Security Score: {http_data.get('security_score', '-')}")
+            if reputation:
+                lines.append(f"- Reputation Risk: {reputation.get('risk_score', '-')}")
             lines.append("")
         target.write_text("\n".join(lines), encoding="utf-8")
         return
@@ -979,6 +1214,8 @@ def build_result(
     port_data: list[dict] | None,
     tls_data: dict | None,
     http_data: dict | None,
+    subdomains_data: dict | None,
+    reputation_data: dict | None,
     cache_hit: bool,
 ) -> dict:
     geo_compare = compare_geo_sources(geo_primary, geo_secondary)
@@ -1027,6 +1264,8 @@ def build_result(
         "ports": port_data,
         "tls": tls_data,
         "http": http_data,
+        "subdomains": subdomains_data,
+        "reputation": reputation_data,
     }
 
 
@@ -1038,16 +1277,30 @@ def analyze_target(
     with_trace: bool,
     with_tls: bool,
     with_http: bool,
+    with_subdomains: bool,
+    with_reputation: bool,
     ports: list[int] | None,
+    threads: int,
 ) -> dict:
     dns_result = resolve_target(target, nameserver)
     geo_primary, geo_secondary, cache_hit = lookup_geo_with_cache(dns_result["bevorzugte_ip"])
-    whois_text = run_whois(dns_result["bevorzugte_ip"])
+
+    whois_text = run_whois(dns_result["bevorzugte_ip"]) if with_whois else None
     ping_data = run_ping(dns_result["bevorzugte_ip"]) if with_ping else None
     trace_data = run_traceroute(dns_result["bevorzugte_ip"]) if with_trace else None
-    port_data = check_ports(dns_result["bevorzugte_ip"], ports) if ports else None
+    port_data = check_ports(dns_result["bevorzugte_ip"], ports, threads=threads) if ports else None
     tls_data = tls_analysis(dns_result["hostname"], dns_result["bevorzugte_ip"]) if with_tls else None
     http_data = analyze_http(dns_result["eingabe"], dns_result["hostname"]) if with_http else None
+
+    provider = detect_provider(
+        geo_primary.get("organisation", "-"),
+        geo_primary.get("isp", "-"),
+        geo_primary.get("as", "-"),
+        dns_result.get("reverse_dns", "-"),
+    )
+
+    subdomains_data = discover_subdomains(dns_result["hostname"], nameserver, threads) if (with_subdomains and dns_result["hostname"]) else None
+    reputation_data = check_reputation(dns_result["bevorzugte_ip"], dns_result["reverse_dns"], provider["provider"]) if with_reputation else None
 
     return build_result(
         dns_result=dns_result,
@@ -1059,6 +1312,8 @@ def analyze_target(
         port_data=port_data,
         tls_data=tls_data,
         http_data=http_data,
+        subdomains_data=subdomains_data,
+        reputation_data=reputation_data,
         cache_hit=cache_hit,
     )
 
@@ -1204,6 +1459,51 @@ def print_http_block(http_data: dict | None, use_color: bool) -> None:
         print(f"    {key}: {value}")
 
 
+def print_subdomains_block(subdomains_data: dict | None, use_color: bool) -> None:
+    if subdomains_data is None:
+        return
+
+    print(f"{style('Subdomain Discovery:', BOLD + MAGENTA, use_color)}")
+    if subdomains_data.get("status") != "ok":
+        print(f"  Fehler: {subdomains_data.get('message', '-')}")
+        return
+
+    print(f"  Gesamt gefunden: {len(subdomains_data.get('gesamt', []))}")
+    print(f"  crt.sh Treffer:  {len(subdomains_data.get('crtsh', []))}")
+    print(f"  Bruteforce DNS:  {len(subdomains_data.get('bruteforce', []))}")
+
+    print("  Beispiele:")
+    shown = 0
+    for name in subdomains_data.get("gesamt", [])[:20]:
+        print(f"    {name}")
+        shown += 1
+    if shown == 0:
+        print("    -")
+
+
+def print_reputation_block(reputation_data: dict | None, use_color: bool) -> None:
+    if reputation_data is None:
+        return
+
+    print(f"{style('Reputation / Blacklist Check:', BOLD + MAGENTA, use_color)}")
+    if reputation_data.get("status") != "ok":
+        print(f"  Fehler: {reputation_data.get('message', '-')}")
+        return
+
+    print(f"  Risk Score: {reputation_data.get('risk_score', '-')}")
+    print("  Gründe:")
+    for reason in reputation_data.get("reasons", []) or ["-"]:
+        print(f"    - {reason}")
+
+    print("  DNSBL Checks:")
+    for item in reputation_data.get("ipv4_dnsbl_checks", []):
+        print(
+            f"    {item.get('quelle', '-')}: "
+            f"{'gelistet' if item.get('gelistet') else 'nicht gelistet'} "
+            f"({item.get('antwort', '-')})"
+        )
+
+
 def print_whois_block(whois_text: str | None, use_color: bool) -> None:
     if whois_text is None:
         return
@@ -1272,6 +1572,7 @@ def print_table_block(result: dict) -> None:
     geo = result["geoip"]["primaer"]
     asn = result["asn"]
     http_data = result.get("http")
+    reputation = result.get("reputation")
 
     rows = [
         ("Eingabe", result["eingabe"]),
@@ -1294,6 +1595,7 @@ def print_table_block(result: dict) -> None:
         ("HTTP Status", http_data.get("http_status", "-") if http_data else "-"),
         ("Server", http_data.get("server", "-") if http_data else "-"),
         ("CDN", http_data.get("cdn", {}).get("name", "-") if http_data else "-"),
+        ("Reputation", reputation.get("risk_score", "-") if reputation else "-"),
     ]
 
     width = max(len(k) for k, _ in rows)
@@ -1306,6 +1608,7 @@ def print_compact_block(result: dict) -> None:
     geo = result["geoip"]["primaer"]
     asn = result["asn"]
     http_data = result.get("http")
+    reputation = result.get("reputation")
 
     print(
         f"{result['eingabe']} | "
@@ -1317,6 +1620,7 @@ def print_compact_block(result: dict) -> None:
         f"RIR={asn.get('rir', '-')} | "
         f"Provider={geo.get('provider_erkannt', '-')} | "
         f"CDN={http_data.get('cdn', {}).get('name', '-') if http_data else '-'} | "
+        f"REP={reputation.get('risk_score', '-') if reputation else '-'} | "
         f"VPN={geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}"
     )
 
@@ -1333,7 +1637,8 @@ HELP_TEXT = f"""woist {APP_VERSION}
 
 Kurzbeschreibung:
   CLI-Tool zur Analyse von IPs, Domains und URLs.
-  Es kombiniert DNS, GeoIP, ASN/Netzbereich, Whois, Ping, Traceroute, Portcheck, TLS und HTTP/CDN-Analyse.
+  Es kombiniert DNS, GeoIP, ASN/Netzbereich, Whois, Ping, Traceroute, Portcheck, TLS,
+  HTTP/CDN-Analyse, Subdomain Discovery, Reputation-Checks und parallele Scans.
 
 Aufruf:
   woist [OPTIONEN] ziel
@@ -1342,11 +1647,13 @@ Aufruf:
 
 Wichtige Befehle / Optionen:
   -h, --help, -help     Zeigt diesen Hilfebereich mit allen Befehlen an
+  --version             Zeigt die Version an
   --json                Gibt die Ausgabe als JSON aus
   --compact             Kompakte Ein-Zeilen-Ausgabe
   --table               Tabellarische Kurz-Ausgabe
   --raw                 Ausgabe ohne Styling / ohne Farben
   --no-color            Deaktiviert Farbausgabe
+  --threads ZAHL        Anzahl paralleler Threads, Standard: {DEFAULT_THREADS}
 
 Ziele:
   ziel                  IP-Adresse, Domain oder URL
@@ -1369,12 +1676,15 @@ Netzwerk:
   --ports LISTE         Prüft TCP-Ports, z. B. 80,443,22
   --tls                 Führt TLS-/HTTPS-Zertifikatsanalyse aus
   --http                Führt HTTP-/Server-/CDN-/Security-Header-Analyse aus
+  --subdomains          Führt Subdomain Discovery aus
+  --reputation          Führt Blacklist-/DNSBL-/Reputation-Check aus
 
 Export:
   --out DATEI           Exportiert Ergebnis nach .json, .csv oder .md
 
 Beispiele:
   woist github.com
+  woist --version
   woist --all github.com
   woist --asn github.com
   woist --dns 8.8.8.8 github.com
@@ -1382,7 +1692,9 @@ Beispiele:
   woist --trace --ports 80,443 github.com
   woist --tls github.com
   woist --http github.com
-  woist --file targets.txt --compact
+  woist --subdomains github.com
+  woist --reputation 8.8.8.8
+  woist --threads 16 --file targets.txt --compact
   woist --out report.json github.com
   woist --out report.csv github.com
   woist --out report.md github.com
@@ -1398,6 +1710,7 @@ def main() -> int:
     parser.add_argument("ziele", nargs="*", help="IP-Adresse, URL oder Hostname")
     parser.add_argument("--file", help="liest zusätzliche Ziele aus einer Datei")
     parser.add_argument("--dns", dest="dns_server", help="nutzt diesen DNS-Server für Abfragen")
+    parser.add_argument("--version", action="store_true", help="zeigt die Version an")
     parser.add_argument("--json", action="store_true", dest="json_output", help="gibt die Ausgabe als JSON aus")
     parser.add_argument("--ip", action="store_true", help="zeigt die bevorzugte aufgelöste IP an")
     parser.add_argument("--all", action="store_true", help="zeigt alle gefundenen DNS-Daten an")
@@ -1408,6 +1721,9 @@ def main() -> int:
     parser.add_argument("--ports", help="prüft TCP-Ports, z. B. 80,443,22")
     parser.add_argument("--tls", action="store_true", help="führt TLS-/HTTPS-Zertifikatsanalyse aus")
     parser.add_argument("--http", action="store_true", help="führt HTTP-/Server-/CDN-/Security-Header-Analyse aus")
+    parser.add_argument("--subdomains", action="store_true", help="führt Subdomain Discovery aus")
+    parser.add_argument("--reputation", action="store_true", help="führt Blacklist-/DNSBL-/Reputation-Check aus")
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS, help="Anzahl paralleler Threads")
     parser.add_argument("--compact", action="store_true", help="kompakte Ein-Zeilen-Ausgabe")
     parser.add_argument("--table", action="store_true", help="tabellarische Kurz-Ausgabe")
     parser.add_argument("--raw", action="store_true", help="zeigt Rohdaten ohne Styling")
@@ -1418,6 +1734,10 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
+        if args.version:
+            print(APP_VERSION)
+            return 0
+
         if args.clear_cache:
             removed = clear_cache()
             print("Cache gelöscht." if removed else "Kein Cache vorhanden.")
@@ -1430,13 +1750,17 @@ def main() -> int:
         if args.dns_server:
             ipaddress.ip_address(args.dns_server)
 
+        if args.threads < 1:
+            raise ValueError("Threads müssen mindestens 1 sein.")
+
         ports = parse_ports(args.ports)
         targets = read_targets(args.ziele, args.file)
 
-        results = []
-        for target in targets:
-            results.append(
-                analyze_target(
+        results: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(targets), args.threads)) as executor:
+            futures = [
+                executor.submit(
+                    analyze_target,
                     target=target,
                     nameserver=args.dns_server,
                     with_whois=args.whois,
@@ -1444,9 +1768,19 @@ def main() -> int:
                     with_trace=args.trace,
                     with_tls=args.tls,
                     with_http=args.http,
+                    with_subdomains=args.subdomains,
+                    with_reputation=args.reputation,
                     ports=ports,
+                    threads=args.threads,
                 )
-            )
+                for target in targets
+            ]
+
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+        result_order = {normalize_target(target): idx for idx, target in enumerate(targets)}
+        results.sort(key=lambda item: result_order.get(item["eingabe"], 999999))
 
         if args.out:
             export_results(args.out, results)
@@ -1472,6 +1806,12 @@ def main() -> int:
                 if args.http:
                     print()
                     print_http_block(result["http"], use_color=False)
+                if args.subdomains:
+                    print()
+                    print_subdomains_block(result["subdomains"], use_color=False)
+                if args.reputation:
+                    print()
+                    print_reputation_block(result["reputation"], use_color=False)
                 if args.whois:
                     print()
                     print_whois_block(result["whois"], use_color=False)
@@ -1497,6 +1837,14 @@ def main() -> int:
                 if args.http:
                     print()
                     print_http_block(result["http"], use_color=use_color)
+
+                if args.subdomains:
+                    print()
+                    print_subdomains_block(result["subdomains"], use_color=use_color)
+
+                if args.reputation:
+                    print()
+                    print_reputation_block(result["reputation"], use_color=use_color)
 
                 if args.tls:
                     print()
