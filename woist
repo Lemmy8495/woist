@@ -26,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 
-APP_VERSION = "4.1.0"
+APP_VERSION = "5.0.0"
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -750,6 +750,112 @@ def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float 
         }
 
 
+def detect_cdn_from_headers(headers: dict[str, str]) -> dict:
+    joined = " ".join(f"{k}:{v}" for k, v in headers.items()).lower()
+
+    patterns = [
+        ("Cloudflare", ["cloudflare", "cf-ray", "cf-cache-status", "__cf_bm"]),
+        ("Fastly", ["fastly", "x-served-by", "x-cache", "fastly-debug"]),
+        ("Akamai", ["akamai", "akamai-grn"]),
+        ("CloudFront", ["cloudfront", "x-amz-cf-id", "x-amz-cf-pop"]),
+        ("GitHub Pages / GitHub", ["github", "x-github-request-id"]),
+        ("Vercel", ["vercel", "x-vercel-id"]),
+        ("Netlify", ["netlify"]),
+    ]
+
+    for name, keys in patterns:
+        if any(key in joined for key in keys):
+            return {"erkannt": True, "name": name}
+
+    return {"erkannt": False, "name": "-"}
+
+
+def analyze_http(target: str, hostname: str | None) -> dict:
+    host = hostname or target
+    schemes = ["https", "http"]
+    last_error = "-"
+
+    for scheme in schemes:
+        url = f"{scheme}://{host}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": f"woist/{APP_VERSION}",
+                "Accept": "*/*",
+            },
+            method="GET",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=8) as response:
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                status = getattr(response, "status", getattr(response, "code", "-"))
+                final_url = response.geturl()
+
+                security_headers = {
+                    "strict-transport-security": headers.get("strict-transport-security", "-"),
+                    "content-security-policy": headers.get("content-security-policy", "-"),
+                    "x-frame-options": headers.get("x-frame-options", "-"),
+                    "x-content-type-options": headers.get("x-content-type-options", "-"),
+                    "referrer-policy": headers.get("referrer-policy", "-"),
+                    "permissions-policy": headers.get("permissions-policy", "-"),
+                }
+
+                present = sum(1 for value in security_headers.values() if value != "-")
+                if present >= 5:
+                    score = "hoch"
+                elif present >= 3:
+                    score = "mittel"
+                else:
+                    score = "niedrig"
+
+                cdn = detect_cdn_from_headers(headers)
+
+                return {
+                    "status": "ok",
+                    "scheme": scheme,
+                    "url": final_url,
+                    "http_status": status,
+                    "server": headers.get("server", "-"),
+                    "x_powered_by": headers.get("x-powered-by", "-"),
+                    "via": headers.get("via", "-"),
+                    "security_headers": security_headers,
+                    "security_score": score,
+                    "cdn": cdn,
+                }
+        except urllib.error.HTTPError as exc:
+            headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
+            security_headers = {
+                "strict-transport-security": headers.get("strict-transport-security", "-"),
+                "content-security-policy": headers.get("content-security-policy", "-"),
+                "x-frame-options": headers.get("x-frame-options", "-"),
+                "x-content-type-options": headers.get("x-content-type-options", "-"),
+                "referrer-policy": headers.get("referrer-policy", "-"),
+                "permissions-policy": headers.get("permissions-policy", "-"),
+            }
+            cdn = detect_cdn_from_headers(headers)
+
+            return {
+                "status": "ok",
+                "scheme": scheme,
+                "url": url,
+                "http_status": exc.code,
+                "server": headers.get("server", "-"),
+                "x_powered_by": headers.get("x-powered-by", "-"),
+                "via": headers.get("via", "-"),
+                "security_headers": security_headers,
+                "security_score": "niedrig",
+                "cdn": cdn,
+            }
+        except Exception as exc:
+            last_error = str(exc)
+
+    return {
+        "status": "error",
+        "message": last_error,
+    }
+
+
 def export_results(path: str, results: list[dict]) -> None:
     target = Path(path)
     suffix = target.suffix.lower()
@@ -767,6 +873,7 @@ def export_results(path: str, results: list[dict]) -> None:
             dns = result["dns"]
             geo = result["geoip"]["primaer"]
             asn = result["asn"]
+            http_data = result.get("http")
             rows.append({
                 "eingabe": result["eingabe"],
                 "typ": result["typ"],
@@ -783,6 +890,10 @@ def export_results(path: str, results: list[dict]) -> None:
                 "cidr": asn.get("cidr", "-"),
                 "rir": asn.get("rir", "-"),
                 "owner": asn.get("owner", "-"),
+                "http_status": http_data.get("http_status", "-") if http_data else "-",
+                "server": http_data.get("server", "-") if http_data else "-",
+                "cdn": http_data.get("cdn", {}).get("name", "-") if http_data else "-",
+                "security_score": http_data.get("security_score", "-") if http_data else "-",
             })
 
         with target.open("w", newline="", encoding="utf-8") as f:
@@ -798,6 +909,7 @@ def export_results(path: str, results: list[dict]) -> None:
             dns = result["dns"]
             geo = result["geoip"]["primaer"]
             asn = result["asn"]
+            http_data = result.get("http")
             lines.append(f"## {result['eingabe']}")
             lines.append("")
             lines.append(f"- Typ: {result['typ']}")
@@ -814,6 +926,11 @@ def export_results(path: str, results: list[dict]) -> None:
             lines.append(f"- CIDR: {asn.get('cidr', '-')}")
             lines.append(f"- RIR: {asn.get('rir', '-')}")
             lines.append(f"- Owner: {asn.get('owner', '-')}")
+            if http_data:
+                lines.append(f"- HTTP Status: {http_data.get('http_status', '-')}")
+                lines.append(f"- Server: {http_data.get('server', '-')}")
+                lines.append(f"- CDN: {http_data.get('cdn', {}).get('name', '-')}")
+                lines.append(f"- Security Score: {http_data.get('security_score', '-')}")
             lines.append("")
         target.write_text("\n".join(lines), encoding="utf-8")
         return
@@ -861,6 +978,7 @@ def build_result(
     trace_data: dict | None,
     port_data: list[dict] | None,
     tls_data: dict | None,
+    http_data: dict | None,
     cache_hit: bool,
 ) -> dict:
     geo_compare = compare_geo_sources(geo_primary, geo_secondary)
@@ -908,6 +1026,7 @@ def build_result(
         "trace": trace_data,
         "ports": port_data,
         "tls": tls_data,
+        "http": http_data,
     }
 
 
@@ -918,6 +1037,7 @@ def analyze_target(
     with_ping: bool,
     with_trace: bool,
     with_tls: bool,
+    with_http: bool,
     ports: list[int] | None,
 ) -> dict:
     dns_result = resolve_target(target, nameserver)
@@ -927,6 +1047,7 @@ def analyze_target(
     trace_data = run_traceroute(dns_result["bevorzugte_ip"]) if with_trace else None
     port_data = check_ports(dns_result["bevorzugte_ip"], ports) if ports else None
     tls_data = tls_analysis(dns_result["hostname"], dns_result["bevorzugte_ip"]) if with_tls else None
+    http_data = analyze_http(dns_result["eingabe"], dns_result["hostname"]) if with_http else None
 
     return build_result(
         dns_result=dns_result,
@@ -937,6 +1058,7 @@ def analyze_target(
         trace_data=trace_data,
         port_data=port_data,
         tls_data=tls_data,
+        http_data=http_data,
         cache_hit=cache_hit,
     )
 
@@ -1059,6 +1181,29 @@ def print_tls_block(tls_data: dict | None, use_color: bool) -> None:
         print(f"    {item}")
 
 
+def print_http_block(http_data: dict | None, use_color: bool) -> None:
+    if http_data is None:
+        return
+
+    print(f"{style('HTTP / Server / CDN Analyse:', BOLD + MAGENTA, use_color)}")
+    if http_data.get("status") != "ok":
+        print(f"  Fehler:           {http_data.get('message', '-')}")
+        return
+
+    print(f"  Scheme:           {http_data.get('scheme', '-')}")
+    print(f"  URL:              {http_data.get('url', '-')}")
+    print(f"  HTTP Status:      {http_data.get('http_status', '-')}")
+    print(f"  Server:           {http_data.get('server', '-')}")
+    print(f"  X-Powered-By:     {http_data.get('x_powered_by', '-')}")
+    print(f"  Via:              {http_data.get('via', '-')}")
+    print(f"  CDN erkannt:      {'ja' if http_data.get('cdn', {}).get('erkannt') else 'nein'}")
+    print(f"  CDN Name:         {http_data.get('cdn', {}).get('name', '-')}")
+    print(f"  Security Score:   {http_data.get('security_score', '-')}")
+    print("  Security Headers:")
+    for key, value in http_data.get("security_headers", {}).items():
+        print(f"    {key}: {value}")
+
+
 def print_whois_block(whois_text: str | None, use_color: bool) -> None:
     if whois_text is None:
         return
@@ -1126,6 +1271,7 @@ def print_table_block(result: dict) -> None:
     dns = result["dns"]
     geo = result["geoip"]["primaer"]
     asn = result["asn"]
+    http_data = result.get("http")
 
     rows = [
         ("Eingabe", result["eingabe"]),
@@ -1145,6 +1291,9 @@ def print_table_block(result: dict) -> None:
         ("Provider", geo.get("provider_erkannt", "-")),
         ("Netztyp", geo.get("netztyp", "-")),
         ("VPN/Proxy-Verdacht", geo.get("vpn_proxy_verdacht", {}).get("verdacht", "-")),
+        ("HTTP Status", http_data.get("http_status", "-") if http_data else "-"),
+        ("Server", http_data.get("server", "-") if http_data else "-"),
+        ("CDN", http_data.get("cdn", {}).get("name", "-") if http_data else "-"),
     ]
 
     width = max(len(k) for k, _ in rows)
@@ -1156,6 +1305,7 @@ def print_compact_block(result: dict) -> None:
     dns = result["dns"]
     geo = result["geoip"]["primaer"]
     asn = result["asn"]
+    http_data = result.get("http")
 
     print(
         f"{result['eingabe']} | "
@@ -1166,6 +1316,7 @@ def print_compact_block(result: dict) -> None:
         f"CIDR={asn.get('cidr', '-')} | "
         f"RIR={asn.get('rir', '-')} | "
         f"Provider={geo.get('provider_erkannt', '-')} | "
+        f"CDN={http_data.get('cdn', {}).get('name', '-') if http_data else '-'} | "
         f"VPN={geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}"
     )
 
@@ -1182,7 +1333,7 @@ HELP_TEXT = f"""woist {APP_VERSION}
 
 Kurzbeschreibung:
   CLI-Tool zur Analyse von IPs, Domains und URLs.
-  Es kombiniert DNS, GeoIP, ASN/Netzbereich, Whois, Ping, Traceroute, Portcheck und TLS-Analyse.
+  Es kombiniert DNS, GeoIP, ASN/Netzbereich, Whois, Ping, Traceroute, Portcheck, TLS und HTTP/CDN-Analyse.
 
 Aufruf:
   woist [OPTIONEN] ziel
@@ -1217,6 +1368,7 @@ Netzwerk:
   --trace               Führt ein kurzes Traceroute aus
   --ports LISTE         Prüft TCP-Ports, z. B. 80,443,22
   --tls                 Führt TLS-/HTTPS-Zertifikatsanalyse aus
+  --http                Führt HTTP-/Server-/CDN-/Security-Header-Analyse aus
 
 Export:
   --out DATEI           Exportiert Ergebnis nach .json, .csv oder .md
@@ -1229,6 +1381,7 @@ Beispiele:
   woist --whois --ping github.com
   woist --trace --ports 80,443 github.com
   woist --tls github.com
+  woist --http github.com
   woist --file targets.txt --compact
   woist --out report.json github.com
   woist --out report.csv github.com
@@ -1254,6 +1407,7 @@ def main() -> int:
     parser.add_argument("--trace", action="store_true", help="führt ein kurzes traceroute aus")
     parser.add_argument("--ports", help="prüft TCP-Ports, z. B. 80,443,22")
     parser.add_argument("--tls", action="store_true", help="führt TLS-/HTTPS-Zertifikatsanalyse aus")
+    parser.add_argument("--http", action="store_true", help="führt HTTP-/Server-/CDN-/Security-Header-Analyse aus")
     parser.add_argument("--compact", action="store_true", help="kompakte Ein-Zeilen-Ausgabe")
     parser.add_argument("--table", action="store_true", help="tabellarische Kurz-Ausgabe")
     parser.add_argument("--raw", action="store_true", help="zeigt Rohdaten ohne Styling")
@@ -1289,6 +1443,7 @@ def main() -> int:
                     with_ping=args.ping,
                     with_trace=args.trace,
                     with_tls=args.tls,
+                    with_http=args.http,
                     ports=ports,
                 )
             )
@@ -1314,6 +1469,9 @@ def main() -> int:
                 if args.asn:
                     print()
                     print_asn_block(result["asn"], use_color=False)
+                if args.http:
+                    print()
+                    print_http_block(result["http"], use_color=False)
                 if args.whois:
                     print()
                     print_whois_block(result["whois"], use_color=False)
@@ -1335,6 +1493,10 @@ def main() -> int:
                 print_geo_block(result, use_color=use_color)
                 print()
                 print_asn_block(result["asn"], use_color=use_color)
+
+                if args.http:
+                    print()
+                    print_http_block(result["http"], use_color=use_color)
 
                 if args.tls:
                     print()
