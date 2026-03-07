@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import argparse
+import ipaddress
+import socket
+import sys
+
+import requests
+
+
+API_URL = "http://ip-api.com/json/{target}?fields=status,message,query,country,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse"
+
+
+def resolve_target(value: str) -> str:
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+
+    cleaned = value.strip()
+    for prefix in ("http://", "https://"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+
+    cleaned = cleaned.split("/")[0].split(":")[0].strip()
+    if not cleaned:
+        raise ValueError("Kein gültiges Ziel übergeben.")
+
+    return socket.gethostbyname(cleaned)
+
+
+def lookup_ip(target: str) -> dict:
+    response = requests.get(API_URL.format(target=target), timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("status") != "success":
+        raise RuntimeError(data.get("message", "Unbekannter API-Fehler"))
+
+    return data
+
+
+def print_result(data: dict) -> None:
+    print(f"Ziel-IP:      {data.get('query', '-')}")
+    print(f"Land:         {data.get('country', '-')}")
+    print(f"Region:       {data.get('regionName', '-')}")
+    print(f"Stadt:        {data.get('city', '-')}")
+    print(f"PLZ:          {data.get('zip', '-')}")
+    print(f"Breitengrad:  {data.get('lat', '-')}")
+    print(f"Längengrad:   {data.get('lon', '-')}")
+    print(f"Zeitzone:     {data.get('timezone', '-')}")
+    print(f"ISP:          {data.get('isp', '-')}")
+    print(f"Organisation: {data.get('org', '-')}")
+    print(f"AS:           {data.get('as', '-')}")
+    print(f"Reverse DNS:  {data.get('reverse', '-')}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Zeigt den ungefähren Standort zu einer IP oder URL an."
+    )
+    parser.add_argument("ziel", help="IP-Adresse oder URL/Hostname")
+    args = parser.parse_args()
+
+    try:
+        target_ip = resolve_target(args.ziel)
+        data = lookup_ip(target_ip)
+        print_result(data)
+        return 0
+    except socket.gaierror:
+        print("Fehler: Hostname konnte nicht aufgelöst werden.", file=sys.stderr)
+        return 1
+    except requests.RequestException as exc:
+        print(f"Fehler bei der API-Abfrage: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
