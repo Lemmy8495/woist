@@ -8,40 +8,80 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-API_URL = "http://ip-api.com/json/{target}?fields=status,message,query,country,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse"
+API_URL = (
+    "http://ip-api.com/json/{target}"
+    "?fields=status,message,query,country,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse"
+)
 
 
-def resolve_target(value: str) -> str:
-    try:
-        ipaddress.ip_address(value)
-        return value
-    except ValueError:
-        pass
-
+def normalize_target(value: str) -> str:
     cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Kein Ziel übergeben.")
+
     for prefix in ("http://", "https://"):
         if cleaned.startswith(prefix):
             cleaned = cleaned[len(prefix):]
 
-    cleaned = cleaned.split("/")[0].split(":")[0].strip()
-    if not cleaned:
-        raise ValueError("Kein gültiges Ziel übergeben.")
+    if "/" in cleaned:
+        cleaned = cleaned.split("/", 1)[0]
 
-    return socket.gethostbyname(cleaned)
+    if cleaned.startswith("[") and "]" in cleaned:
+        cleaned = cleaned[1:].split("]", 1)[0]
+    elif cleaned.count(":") == 1 and not cleaned.replace(":", "").isdigit():
+        cleaned = cleaned.rsplit(":", 1)[0]
+
+    return cleaned.strip()
+
+
+def resolve_target(value: str) -> tuple[str, str]:
+    cleaned = normalize_target(value)
+
+    try:
+        ipaddress.ip_address(cleaned)
+        return cleaned, cleaned
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(cleaned, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise RuntimeError(
+            f"Hostname konnte nicht aufgelöst werden: {cleaned}"
+        ) from exc
+
+    addresses = []
+    for info in infos:
+        addr = info[4][0]
+        if addr not in addresses:
+            addresses.append(addr)
+
+    if not addresses:
+        raise RuntimeError(f"Keine IP-Adresse für {cleaned} gefunden.")
+
+    preferred = next((addr for addr in addresses if ":" not in addr), addresses[0])
+    return cleaned, preferred
 
 
 def lookup_ip(target: str) -> dict:
     url = API_URL.format(target=urllib.parse.quote(target, safe=""))
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": "woist/1.0"
-        },
+        headers={"User-Agent": "woist/1.1.0"},
     )
 
-    with urllib.request.urlopen(req, timeout=10) as response:
-        payload = response.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP-Fehler der GeoIP-API: {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Netzwerkfehler bei der API-Abfrage: {exc.reason}") from exc
+
+    try:
         data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ungültige Antwort der GeoIP-API erhalten.") from exc
 
     if data.get("status") != "success":
         raise RuntimeError(data.get("message", "Unbekannter API-Fehler"))
@@ -49,41 +89,81 @@ def lookup_ip(target: str) -> dict:
     return data
 
 
-def print_result(data: dict) -> None:
-    print(f"Ziel-IP:      {data.get('query', '-')}")
-    print(f"Land:         {data.get('country', '-')}")
-    print(f"Region:       {data.get('regionName', '-')}")
-    print(f"Stadt:        {data.get('city', '-')}")
-    print(f"PLZ:          {data.get('zip', '-')}")
-    print(f"Breitengrad:  {data.get('lat', '-')}")
-    print(f"Längengrad:   {data.get('lon', '-')}")
-    print(f"Zeitzone:     {data.get('timezone', '-')}")
-    print(f"ISP:          {data.get('isp', '-')}")
-    print(f"Organisation: {data.get('org', '-')}")
-    print(f"AS:           {data.get('as', '-')}")
-    print(f"Reverse DNS:  {data.get('reverse', '-')}")
+def build_result(original: str, resolved_ip: str, data: dict) -> dict:
+    return {
+        "eingabe": original,
+        "ziel_ip": data.get("query", resolved_ip),
+        "land": data.get("country", "-"),
+        "region": data.get("regionName", "-"),
+        "stadt": data.get("city", "-"),
+        "plz": data.get("zip", "-"),
+        "breitengrad": data.get("lat", "-"),
+        "laengengrad": data.get("lon", "-"),
+        "zeitzone": data.get("timezone", "-"),
+        "isp": data.get("isp", "-"),
+        "organisation": data.get("org", "-"),
+        "as": data.get("as", "-"),
+        "reverse_dns": data.get("reverse", "-"),
+    }
+
+
+def print_text_result(result: dict, show_resolved: bool) -> None:
+    print(f"Eingabe:      {result['eingabe']}")
+    if show_resolved:
+        print(f"Aufgelöst zu: {result['ziel_ip']}")
+    print(f"Land:         {result['land']}")
+    print(f"Region:       {result['region']}")
+    print(f"Stadt:        {result['stadt']}")
+    print(f"PLZ:          {result['plz']}")
+    print(f"Breitengrad:  {result['breitengrad']}")
+    print(f"Längengrad:   {result['laengengrad']}")
+    print(f"Zeitzone:     {result['zeitzone']}")
+    print(f"ISP:          {result['isp']}")
+    print(f"Organisation: {result['organisation']}")
+    print(f"AS:           {result['as']}")
+    print(f"Reverse DNS:  {result['reverse_dns']}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Zeigt den ungefähren Standort zu einer IP oder URL an."
+        description="Zeigt den ungefähren Standort zu einer IP-Adresse oder URL an."
     )
-    parser.add_argument("ziel", help="IP-Adresse oder URL/Hostname")
+    parser.add_argument("ziel", help="IP-Adresse, URL oder Hostname")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Ausgabe als JSON",
+    )
+    parser.add_argument(
+        "--ip",
+        action="store_true",
+        help="Zeigt die aufgelöste Ziel-IP zusätzlich an",
+    )
     args = parser.parse_args()
 
     try:
-        target_ip = resolve_target(args.ziel)
-        data = lookup_ip(target_ip)
-        print_result(data)
+        original, resolved_ip = resolve_target(args.ziel)
+        data = lookup_ip(resolved_ip)
+        result = build_result(original, resolved_ip, data)
+
+        if args.json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print_text_result(result, show_resolved=args.ip)
+
         return 0
-    except socket.gaierror:
-        print("Fehler: Hostname konnte nicht aufgelöst werden.", file=sys.stderr)
+    except KeyboardInterrupt:
+        print("Abbruch durch Benutzer.", file=sys.stderr)
+        return 130
+    except ValueError as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
         return 1
-    except urllib.error.URLError as exc:
-        print(f"Fehler bei der API-Abfrage: {exc}", file=sys.stderr)
+    except RuntimeError as exc:
+        print(f"Fehler: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
+        print(f"Unerwarteter Fehler: {exc}", file=sys.stderr)
         return 1
 
 
