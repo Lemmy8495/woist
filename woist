@@ -26,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -48,9 +48,6 @@ CACHE_FILE = CACHE_DIR / "geoip_cache.json"
 CACHE_TTL = 60 * 60 * 24  # 24 Stunden
 
 
-# =========================
-# utils
-# =========================
 def style(text: str, color: str, use_color: bool) -> str:
     return f"{color}{text}{RESET}" if use_color else text
 
@@ -113,9 +110,6 @@ def read_targets(single_targets: list[str], file_path: str | None) -> list[str]:
     return targets
 
 
-# =========================
-# cache
-# =========================
 def load_cache() -> dict:
     try:
         if CACHE_FILE.exists():
@@ -177,9 +171,6 @@ def cache_stats() -> dict:
     }
 
 
-# =========================
-# dns
-# =========================
 def resolver_instance(nameserver: str | None) -> dns.resolver.Resolver:
     res = dns.resolver.Resolver()
     if nameserver:
@@ -277,9 +268,6 @@ def resolve_target(value: str, nameserver: str | None) -> dict:
     }
 
 
-# =========================
-# geoip
-# =========================
 def http_json(url: str, user_agent: str) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
@@ -337,11 +325,100 @@ def lookup_ipwhois(target: str) -> dict:
         "isp": connection.get("isp", "-"),
         "organisation": connection.get("org", "-"),
         "as": connection.get("asn", "-"),
+        "network": {
+            "cidr": connection.get("cidr", "-"),
+            "route": connection.get("route", "-"),
+        },
         "reverse_dns_api": "-",
         "hosting": False,
         "proxy": False,
         "mobile": False,
     }
+
+
+def run_whois(target: str) -> str:
+    whois_path = shutil.which("whois")
+    if not whois_path:
+        return "whois ist auf diesem System nicht verfügbar."
+
+    try:
+        result = subprocess.run(
+            [whois_path, target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "whois Timeout."
+    except Exception as exc:
+        return f"whois Fehler: {exc}"
+
+    output = (result.stdout or "").strip()
+    if not output:
+        return "Keine whois Ausgabe erhalten."
+
+    return output
+
+
+def extract_whois_network_info(whois_text: str) -> dict:
+    info = {
+        "cidr": "-",
+        "route": "-",
+        "inetnum": "-",
+        "inet6num": "-",
+        "netname": "-",
+        "owner": "-",
+        "org": "-",
+        "country": "-",
+        "origin": "-",
+        "rir": "-",
+    }
+
+    if not whois_text:
+        return info
+
+    lines = whois_text.splitlines()
+    for raw in lines:
+        line = raw.strip()
+        low = line.lower()
+
+        if low.startswith("cidr:") and info["cidr"] == "-":
+            info["cidr"] = line.split(":", 1)[1].strip()
+        elif low.startswith("route:") and info["route"] == "-":
+            info["route"] = line.split(":", 1)[1].strip()
+        elif low.startswith("inetnum:") and info["inetnum"] == "-":
+            info["inetnum"] = line.split(":", 1)[1].strip()
+        elif low.startswith("inet6num:") and info["inet6num"] == "-":
+            info["inet6num"] = line.split(":", 1)[1].strip()
+        elif low.startswith("netname:") and info["netname"] == "-":
+            info["netname"] = line.split(":", 1)[1].strip()
+        elif low.startswith("orgname:") and info["owner"] == "-":
+            info["owner"] = line.split(":", 1)[1].strip()
+        elif low.startswith("organization:") and info["owner"] == "-":
+            info["owner"] = line.split(":", 1)[1].strip()
+        elif low.startswith("owner:") and info["owner"] == "-":
+            info["owner"] = line.split(":", 1)[1].strip()
+        elif low.startswith("org:") and info["org"] == "-":
+            info["org"] = line.split(":", 1)[1].strip()
+        elif low.startswith("country:") and info["country"] == "-":
+            info["country"] = line.split(":", 1)[1].strip()
+        elif low.startswith("origin:") and info["origin"] == "-":
+            info["origin"] = line.split(":", 1)[1].strip()
+
+    text = whois_text.lower()
+    if "arin" in text:
+        info["rir"] = "ARIN"
+    elif "ripe" in text:
+        info["rir"] = "RIPE NCC"
+    elif "apnic" in text:
+        info["rir"] = "APNIC"
+    elif "lacnic" in text:
+        info["rir"] = "LACNIC"
+    elif "afrinic" in text:
+        info["rir"] = "AFRINIC"
+
+    return info
 
 
 def lookup_geo_with_cache(target: str) -> tuple[dict, dict, bool]:
@@ -450,51 +527,6 @@ def vpn_proxy_assessment(primary: dict, secondary: dict, provider: dict) -> dict
     }
 
 
-# =========================
-# whois / ping / trace
-# =========================
-def run_whois(target: str) -> str:
-    whois_path = shutil.which("whois")
-    if not whois_path:
-        return "whois ist auf diesem System nicht verfügbar."
-
-    try:
-        result = subprocess.run(
-            [whois_path, target],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return "whois Timeout."
-    except Exception as exc:
-        return f"whois Fehler: {exc}"
-
-    output = (result.stdout or "").strip()
-    if not output:
-        return "Keine whois Ausgabe erhalten."
-
-    lines = []
-    prefixes = (
-        "OrgName:", "org-name:", "org:", "Organization:", "organisation:",
-        "netname:", "NetName:", "descr:", "country:", "Country:", "origin:",
-        "OriginAS:", "originas:", "CIDR:", "route:", "route6:", "inetnum:",
-        "inet6num:", "owner:", "abuse-mailbox:", "address:"
-    )
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("%") or stripped.startswith("#"):
-            continue
-        if stripped.startswith(prefixes):
-            lines.append(stripped)
-        if len(lines) >= 20:
-            break
-
-    return "\n".join(lines) if lines else "Keine kompakten whois Felder gefunden."
-
-
 def run_ping(target: str) -> dict:
     ping_path = shutil.which("ping")
     ping6_path = shutil.which("ping6")
@@ -556,9 +588,6 @@ def run_traceroute(target: str) -> dict:
     return {"status": "ok", "lines": output.splitlines()[:15]}
 
 
-# =========================
-# ports / service detection
-# =========================
 COMMON_SERVICES = {
     21: "ftp",
     22: "ssh",
@@ -632,8 +661,6 @@ def try_banner(ip: str, port: int, timeout: float = 1.5) -> tuple[str, str]:
 
             if port in (80, 8080):
                 sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-            elif port in (25, 110, 143, 21):
-                pass
             elif port in (443, 8443):
                 return "https", "TLS Dienst erkannt"
 
@@ -688,9 +715,6 @@ def check_ports(ip: str, ports: list[int], timeout: float = 1.5) -> list[dict]:
     return results
 
 
-# =========================
-# tls
-# =========================
 def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float = 3.0) -> dict:
     server_name = hostname or ip
     try:
@@ -726,9 +750,6 @@ def tls_analysis(hostname: str | None, ip: str, port: int = 443, timeout: float 
         }
 
 
-# =========================
-# export
-# =========================
 def export_results(path: str, results: list[dict]) -> None:
     target = Path(path)
     suffix = target.suffix.lower()
@@ -745,6 +766,7 @@ def export_results(path: str, results: list[dict]) -> None:
         for result in results:
             dns = result["dns"]
             geo = result["geoip"]["primaer"]
+            asn = result["asn"]
             rows.append({
                 "eingabe": result["eingabe"],
                 "typ": result["typ"],
@@ -758,6 +780,9 @@ def export_results(path: str, results: list[dict]) -> None:
                 "as": geo.get("as", "-"),
                 "provider": geo.get("provider_erkannt", "-"),
                 "vpn_verdacht": geo.get("vpn_proxy_verdacht", {}).get("verdacht", "-"),
+                "cidr": asn.get("cidr", "-"),
+                "rir": asn.get("rir", "-"),
+                "owner": asn.get("owner", "-"),
             })
 
         with target.open("w", newline="", encoding="utf-8") as f:
@@ -772,6 +797,7 @@ def export_results(path: str, results: list[dict]) -> None:
         for result in results:
             dns = result["dns"]
             geo = result["geoip"]["primaer"]
+            asn = result["asn"]
             lines.append(f"## {result['eingabe']}")
             lines.append("")
             lines.append(f"- Typ: {result['typ']}")
@@ -785,6 +811,9 @@ def export_results(path: str, results: list[dict]) -> None:
             lines.append(f"- AS: {geo.get('as', '-')}")
             lines.append(f"- Provider: {geo.get('provider_erkannt', '-')}")
             lines.append(f"- VPN/Proxy-Verdacht: {geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}")
+            lines.append(f"- CIDR: {asn.get('cidr', '-')}")
+            lines.append(f"- RIR: {asn.get('rir', '-')}")
+            lines.append(f"- Owner: {asn.get('owner', '-')}")
             lines.append("")
         target.write_text("\n".join(lines), encoding="utf-8")
         return
@@ -792,9 +821,37 @@ def export_results(path: str, results: list[dict]) -> None:
     raise ValueError("Nicht unterstütztes Exportformat. Nutze .json, .csv oder .md")
 
 
-# =========================
-# result building
-# =========================
+def build_asn_block(primary: dict, secondary: dict, whois_info: dict) -> dict:
+    raw_as = str(primary.get("as", "-"))
+    as_number = "-"
+    as_name = "-"
+
+    if raw_as.startswith("AS"):
+        parts = raw_as.split(" ", 1)
+        as_number = parts[0]
+        as_name = parts[1] if len(parts) > 1 else "-"
+
+    cidr = whois_info.get("cidr", "-")
+    if cidr == "-" and isinstance(secondary.get("network"), dict):
+        cidr = secondary["network"].get("cidr", "-")
+
+    return {
+        "as_raw": raw_as,
+        "as_number": as_number,
+        "as_name": as_name,
+        "cidr": cidr,
+        "route": whois_info.get("route", "-"),
+        "inetnum": whois_info.get("inetnum", "-"),
+        "inet6num": whois_info.get("inet6num", "-"),
+        "netname": whois_info.get("netname", "-"),
+        "owner": whois_info.get("owner", "-"),
+        "org": whois_info.get("org", "-"),
+        "country": whois_info.get("country", "-"),
+        "origin": whois_info.get("origin", "-"),
+        "rir": whois_info.get("rir", "-"),
+    }
+
+
 def build_result(
     dns_result: dict,
     geo_primary: dict,
@@ -820,6 +877,9 @@ def build_result(
     geo_primary["provider_typ"] = provider["typ"]
     geo_primary["vpn_proxy_verdacht"] = vpn_assessment
 
+    whois_info = extract_whois_network_info(whois_text or "")
+    asn_block = build_asn_block(geo_primary, geo_secondary, whois_info)
+
     return {
         "eingabe": dns_result["eingabe"],
         "typ": dns_result["typ"],
@@ -842,6 +902,7 @@ def build_result(
             "sekundaer": geo_secondary,
             "vergleich": geo_compare,
         },
+        "asn": asn_block,
         "whois": whois_text,
         "ping": ping_data,
         "trace": trace_data,
@@ -861,7 +922,7 @@ def analyze_target(
 ) -> dict:
     dns_result = resolve_target(target, nameserver)
     geo_primary, geo_secondary, cache_hit = lookup_geo_with_cache(dns_result["bevorzugte_ip"])
-    whois_text = run_whois(dns_result["bevorzugte_ip"]) if with_whois else None
+    whois_text = run_whois(dns_result["bevorzugte_ip"])
     ping_data = run_ping(dns_result["bevorzugte_ip"]) if with_ping else None
     trace_data = run_traceroute(dns_result["bevorzugte_ip"]) if with_trace else None
     port_data = check_ports(dns_result["bevorzugte_ip"], ports) if ports else None
@@ -880,9 +941,6 @@ def analyze_target(
     )
 
 
-# =========================
-# output
-# =========================
 def print_dns_block(result: dict, show_preferred_ip: bool, show_all: bool, use_color: bool) -> None:
     dns = result["dns"]
 
@@ -961,6 +1019,26 @@ def print_geo_block(result: dict, use_color: bool) -> None:
     print(f"  Score:              {c.get('score', '-')}/6")
 
 
+def print_asn_block(asn_data: dict | None, use_color: bool) -> None:
+    if asn_data is None:
+        return
+
+    print(f"{style('ASN / Netzwerkbereich:', BOLD + MAGENTA, use_color)}")
+    print(f"  AS roh:             {asn_data.get('as_raw', '-')}")
+    print(f"  AS Nummer:          {asn_data.get('as_number', '-')}")
+    print(f"  AS Name:            {asn_data.get('as_name', '-')}")
+    print(f"  CIDR:               {asn_data.get('cidr', '-')}")
+    print(f"  Route:              {asn_data.get('route', '-')}")
+    print(f"  Inetnum:            {asn_data.get('inetnum', '-')}")
+    print(f"  Inet6num:           {asn_data.get('inet6num', '-')}")
+    print(f"  Netname:            {asn_data.get('netname', '-')}")
+    print(f"  Owner:              {asn_data.get('owner', '-')}")
+    print(f"  Org:                {asn_data.get('org', '-')}")
+    print(f"  Country:            {asn_data.get('country', '-')}")
+    print(f"  Origin:             {asn_data.get('origin', '-')}")
+    print(f"  RIR:                {asn_data.get('rir', '-')}")
+
+
 def print_tls_block(tls_data: dict | None, use_color: bool) -> None:
     if tls_data is None:
         return
@@ -976,7 +1054,7 @@ def print_tls_block(tls_data: dict | None, use_color: bool) -> None:
     print(f"  Issuer CN:     {tls_data.get('issuer_cn', '-')}")
     print(f"  Gueltig ab:    {tls_data.get('not_before', '-')}")
     print(f"  Gueltig bis:   {tls_data.get('not_after', '-')}")
-    print(f"  SAN DNS:")
+    print("  SAN DNS:")
     for item in tls_data.get("san_dns", []) or ["-"]:
         print(f"    {item}")
 
@@ -986,7 +1064,24 @@ def print_whois_block(whois_text: str | None, use_color: bool) -> None:
         return
 
     print(f"{style('Whois:', BOLD + MAGENTA, use_color)}")
+    lines = []
+    prefixes = (
+        "OrgName:", "org-name:", "org:", "Organization:", "organisation:",
+        "netname:", "NetName:", "descr:", "country:", "Country:", "origin:",
+        "OriginAS:", "originas:", "CIDR:", "route:", "route6:", "inetnum:",
+        "inet6num:", "owner:", "abuse-mailbox:", "address:"
+    )
+
     for line in whois_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%") or stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefixes):
+            lines.append(stripped)
+        if len(lines) >= 20:
+            break
+
+    for line in lines or ["Keine kompakten whois Felder gefunden."]:
         print(f"  {line}")
 
 
@@ -1030,6 +1125,7 @@ def print_ports_block(port_data: list[dict] | None, use_color: bool) -> None:
 def print_table_block(result: dict) -> None:
     dns = result["dns"]
     geo = result["geoip"]["primaer"]
+    asn = result["asn"]
 
     rows = [
         ("Eingabe", result["eingabe"]),
@@ -1043,6 +1139,9 @@ def print_table_block(result: dict) -> None:
         ("ISP", geo.get("isp", "-")),
         ("Organisation", geo.get("organisation", "-")),
         ("AS", geo.get("as", "-")),
+        ("CIDR", asn.get("cidr", "-")),
+        ("RIR", asn.get("rir", "-")),
+        ("Owner", asn.get("owner", "-")),
         ("Provider", geo.get("provider_erkannt", "-")),
         ("Netztyp", geo.get("netztyp", "-")),
         ("VPN/Proxy-Verdacht", geo.get("vpn_proxy_verdacht", {}).get("verdacht", "-")),
@@ -1056,15 +1155,16 @@ def print_table_block(result: dict) -> None:
 def print_compact_block(result: dict) -> None:
     dns = result["dns"]
     geo = result["geoip"]["primaer"]
+    asn = result["asn"]
 
     print(
         f"{result['eingabe']} | "
         f"IP={dns['bevorzugte_ip']} | "
         f"Land={geo.get('land', '-')} | "
-        f"Region={geo.get('region', '-')} | "
         f"Stadt={geo.get('stadt', '-')} | "
-        f"ISP={geo.get('isp', '-')} | "
         f"AS={geo.get('as', '-')} | "
+        f"CIDR={asn.get('cidr', '-')} | "
+        f"RIR={asn.get('rir', '-')} | "
         f"Provider={geo.get('provider_erkannt', '-')} | "
         f"VPN={geo.get('vpn_proxy_verdacht', {}).get('verdacht', '-')}"
     )
@@ -1082,7 +1182,7 @@ HELP_TEXT = f"""woist {APP_VERSION}
 
 Kurzbeschreibung:
   CLI-Tool zur Analyse von IPs, Domains und URLs.
-  Es kombiniert DNS, GeoIP, Whois, Ping, Traceroute, Portcheck und TLS-Analyse.
+  Es kombiniert DNS, GeoIP, ASN/Netzbereich, Whois, Ping, Traceroute, Portcheck und TLS-Analyse.
 
 Aufruf:
   woist [OPTIONEN] ziel
@@ -1106,7 +1206,8 @@ DNS:
   --ip                  Zeigt die bevorzugte aufgelöste IP an
   --all                 Zeigt alle gefundenen DNS-Daten an
 
-GeoIP / Cache:
+GeoIP / ASN / Cache:
+  --asn                 Hebt ASN-, CIDR-, RIR- und Owner-Bereich hervor
   --cache-info          Zeigt Infos zum lokalen Cache
   --clear-cache         Löscht den lokalen Cache
 
@@ -1123,6 +1224,7 @@ Export:
 Beispiele:
   woist github.com
   woist --all github.com
+  woist --asn github.com
   woist --dns 8.8.8.8 github.com
   woist --whois --ping github.com
   woist --trace --ports 80,443 github.com
@@ -1134,9 +1236,6 @@ Beispiele:
 """
 
 
-# =========================
-# cli
-# =========================
 def main() -> int:
     if any(arg in ("-h", "--help", "-help") for arg in sys.argv[1:]):
         print(HELP_TEXT)
@@ -1149,6 +1248,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", dest="json_output", help="gibt die Ausgabe als JSON aus")
     parser.add_argument("--ip", action="store_true", help="zeigt die bevorzugte aufgelöste IP an")
     parser.add_argument("--all", action="store_true", help="zeigt alle gefundenen DNS-Daten an")
+    parser.add_argument("--asn", action="store_true", help="zeigt ASN-, Netzbereich- und RIR-Infos deutlich an")
     parser.add_argument("--whois", action="store_true", help="zeigt eine kompakte whois-Auswertung an")
     parser.add_argument("--ping", action="store_true", help="führt einen kurzen Ping auf die bevorzugte IP aus")
     parser.add_argument("--trace", action="store_true", help="führt ein kurzes traceroute aus")
@@ -1211,6 +1311,9 @@ def main() -> int:
                 print_compact_block(result)
             elif args.table:
                 print_table_block(result)
+                if args.asn:
+                    print()
+                    print_asn_block(result["asn"], use_color=False)
                 if args.whois:
                     print()
                     print_whois_block(result["whois"], use_color=False)
@@ -1230,6 +1333,8 @@ def main() -> int:
                 print_dns_block(result, show_preferred_ip=args.ip, show_all=args.all, use_color=use_color)
                 print()
                 print_geo_block(result, use_color=use_color)
+                print()
+                print_asn_block(result["asn"], use_color=use_color)
 
                 if args.tls:
                     print()
