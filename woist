@@ -15,6 +15,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from woistlib.api_client import ApiClient, ApiRequestError
+from woistlib.cli_inputs import normalize_target as _normalize_target
+from woistlib.cli_inputs import parse_ports as _parse_ports
+from woistlib.cli_inputs import read_targets as _read_targets
+from woistlib.schema import RESULT_SCHEMA_VERSION, wrap_results
+
 try:
     import dns.exception
     import dns.reversename
@@ -27,7 +33,7 @@ except ImportError:
     sys.exit(1)
 
 
-APP_VERSION = "6.0.1"
+APP_VERSION = "6.1.0"
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -111,6 +117,13 @@ DNSBL_ZONES = [
     ("SORBS", "dnsbl.sorbs.net"),
 ]
 
+API_CLIENT = ApiClient(
+    user_agent=f"woist/{APP_VERSION}",
+    timeout=10.0,
+    max_retries=3,
+    base_backoff=0.4,
+)
+
 
 def style(text: str, color: str, use_color: bool) -> str:
     return f"{color}{text}{RESET}" if use_color else text
@@ -125,23 +138,7 @@ def uniq(values: list[str]) -> list[str]:
 
 
 def normalize_target(value: str) -> str:
-    cleaned = value.strip()
-    if not cleaned:
-        raise ValueError("Kein Ziel übergeben.")
-
-    for prefix in ("http://", "https://"):
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-
-    if "/" in cleaned:
-        cleaned = cleaned.split("/", 1)[0]
-
-    if cleaned.startswith("[") and "]" in cleaned:
-        cleaned = cleaned[1:].split("]", 1)[0]
-    elif cleaned.count(":") == 1 and not cleaned.replace(":", "").isdigit():
-        cleaned = cleaned.rsplit(":", 1)[0]
-
-    return cleaned.strip().rstrip(".")
+    return _normalize_target(value)
 
 
 def is_ip(value: str) -> bool:
@@ -153,69 +150,11 @@ def is_ip(value: str) -> bool:
 
 
 def read_targets(single_targets: list[str], file_path: str | None) -> list[str]:
-    targets = []
-    targets.extend(single_targets)
-
-    if file_path:
-        path = Path(file_path)
-        if not path.exists():
-            raise ValueError(f"Datei nicht gefunden: {file_path}")
-
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                targets.append(line)
-
-    targets = uniq(targets)
-
-    if not targets:
-        raise ValueError("Keine Ziele angegeben.")
-
-    return targets
+    return _read_targets(single_targets, file_path)
 
 
 def parse_ports(value: str | None) -> list[int] | None:
-    if value is None:
-        return None
-
-    cleaned = value.strip()
-    if not cleaned:
-        raise ValueError("Portliste ist leer.")
-
-    ports: list[int] = []
-
-    for raw_part in cleaned.split(","):
-        part = raw_part.strip()
-        if not part:
-            raise ValueError("Ungültige Portliste: leere Elemente sind nicht erlaubt.")
-
-        if "-" in part:
-            start_raw, end_raw = part.split("-", 1)
-            if not start_raw.isdigit() or not end_raw.isdigit():
-                raise ValueError(f"Ungültiger Portbereich: {part}")
-
-            start = int(start_raw)
-            end = int(end_raw)
-            if start > end:
-                raise ValueError(f"Ungültiger Portbereich: {part}")
-            if start < 1 or end > 65535:
-                raise ValueError(f"Port außerhalb des gültigen Bereichs (1-65535): {part}")
-
-            ports.extend(range(start, end + 1))
-            continue
-
-        if not part.isdigit():
-            raise ValueError(f"Ungültiger Port: {part}")
-
-        port = int(part)
-        if port < 1 or port > 65535:
-            raise ValueError(f"Port außerhalb des gültigen Bereichs (1-65535): {part}")
-        ports.append(port)
-
-    if not ports:
-        raise ValueError("Portliste ist leer.")
-
-    return sorted(set(ports))
+    return _parse_ports(value)
 
 
 def load_cache() -> dict:
@@ -377,16 +316,10 @@ def resolve_target(value: str, nameserver: str | None) -> dict:
 
 
 def http_json(url: str, user_agent: str) -> dict | list:
-    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP-Fehler bei API-Abfrage: {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Netzwerkfehler bei API-Abfrage: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Ungültige JSON-Antwort erhalten.") from exc
+        return API_CLIENT.get_json(url, user_agent=user_agent)
+    except ApiRequestError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def lookup_ip_api(target: str) -> dict:
@@ -441,6 +374,52 @@ def lookup_ipwhois(target: str) -> dict:
         "hosting": False,
         "proxy": False,
         "mobile": False,
+    }
+
+
+def fallback_primary_from_secondary(target: str, secondary: dict) -> dict:
+    return {
+        "quelle": "fallback-ipwho.is",
+        "ziel_ip": secondary.get("ziel_ip", target),
+        "land": secondary.get("land", "-"),
+        "region": secondary.get("region", "-"),
+        "stadt": secondary.get("stadt", "-"),
+        "plz": secondary.get("plz", "-"),
+        "breitengrad": secondary.get("breitengrad", "-"),
+        "laengengrad": secondary.get("laengengrad", "-"),
+        "zeitzone": secondary.get("zeitzone", "-"),
+        "isp": secondary.get("isp", "-"),
+        "organisation": secondary.get("organisation", "-"),
+        "as": secondary.get("as", "-"),
+        "reverse_dns_api": "-",
+        "hosting": False,
+        "proxy": False,
+        "mobile": False,
+    }
+
+
+def fallback_secondary_from_primary(target: str, primary: dict) -> dict:
+    return {
+        "quelle": "fallback-ip-api",
+        "ziel_ip": primary.get("ziel_ip", target),
+        "land": primary.get("land", "-"),
+        "region": primary.get("region", "-"),
+        "stadt": primary.get("stadt", "-"),
+        "plz": primary.get("plz", "-"),
+        "breitengrad": primary.get("breitengrad", "-"),
+        "laengengrad": primary.get("laengengrad", "-"),
+        "zeitzone": primary.get("zeitzone", "-"),
+        "isp": primary.get("isp", "-"),
+        "organisation": primary.get("organisation", "-"),
+        "as": primary.get("as", "-"),
+        "network": {
+            "cidr": "-",
+            "route": "-",
+        },
+        "reverse_dns_api": primary.get("reverse_dns_api", "-"),
+        "hosting": bool(primary.get("hosting")),
+        "proxy": bool(primary.get("proxy")),
+        "mobile": bool(primary.get("mobile")),
     }
 
 
@@ -534,8 +513,29 @@ def lookup_geo_with_cache(target: str) -> tuple[dict, dict, bool]:
     if cached:
         return cached["primary"], cached["secondary"], True
 
-    primary = lookup_ip_api(target)
-    secondary = lookup_ipwhois(target)
+    errors: list[str] = []
+    primary = None
+    secondary = None
+
+    try:
+        primary = lookup_ip_api(target)
+    except RuntimeError as exc:
+        errors.append(f"ip-api: {exc}")
+
+    try:
+        secondary = lookup_ipwhois(target)
+    except RuntimeError as exc:
+        errors.append(f"ipwho.is: {exc}")
+
+    if primary is None and secondary is None:
+        joined = " | ".join(errors) if errors else "keine Details verfügbar"
+        raise RuntimeError(f"GeoIP-Abfrage für {target} fehlgeschlagen: {joined}")
+
+    if primary is None and secondary is not None:
+        primary = fallback_primary_from_secondary(target, secondary)
+    if secondary is None and primary is not None:
+        secondary = fallback_secondary_from_primary(target, primary)
+
     cache_set(target, {"primary": primary, "secondary": secondary})
 
     return primary, secondary, False
@@ -1092,7 +1092,7 @@ def export_results(path: str, results: list[dict]) -> None:
 
     if suffix == ".json":
         target.write_text(
-            json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2),
+            json.dumps(wrap_results(results), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return
@@ -1236,6 +1236,7 @@ def build_result(
     asn_block = build_asn_block(geo_primary, geo_secondary, whois_info)
 
     return {
+        "schema_version": RESULT_SCHEMA_VERSION,
         "eingabe": dns_result["eingabe"],
         "typ": dns_result["typ"],
         "hostname": dns_result["hostname"],
@@ -1786,7 +1787,7 @@ def main() -> int:
             export_results(args.out, results)
 
         if args.json_output:
-            print(json.dumps(results if len(results) > 1 else results[0], ensure_ascii=False, indent=2))
+            print(json.dumps(wrap_results(results), ensure_ascii=False, indent=2))
             return 0
 
         use_color = not args.no_color and not args.raw
